@@ -1,0 +1,30 @@
+diff --git a/arch/arm/boot/dts/rk3288-veyron-jaq.dts b/arch/arm/boot/dts/rk3288-veyron-jaq.dts
+index c2f52cf..5c97e31 100644
+--- a/arch/arm/boot/dts/rk3288-veyron-jaq.dts
++++ b/arch/arm/boot/dts/rk3288-veyron-jaq.dts
+@@ -142,12 +142,6 @@
+ 		};
+ 	};
+ 
+-	edp {
+-		edp_hpd: edp_hpd {
+-			rockchip,pins = <7 11 RK_FUNC_2 &pcfg_pull_down>;
+-		};
+-	};
+-
+ 	hdmi {
+ 		vcc50_hdmi_en: vcc50-hdmi-en {
+ 			rockchip,pins = <5 19 RK_FUNC_GPIO &pcfg_pull_none>;
+diff --git a/include/linux/clk-provider.h b/include/linux/clk-provider.h
+index 7cd0171..2c139f9 100644
+--- a/include/linux/clk-provider.h
++++ b/include/linux/clk-provider.h
+@@ -31,6 +31,8 @@
+ #define CLK_SET_RATE_NO_REPARENT BIT(7) /* don't re-parent on rate change */
+ #define CLK_GET_ACCURACY_NOCACHE BIT(8) /* do not use the cached clk accuracy */
+ #define CLK_RECALC_NEW_RATES	BIT(9) /* recalc rates after notifications */
++#define CLK_SET_RATE_UNGATE	BIT(10) /* clock needs to run to set rate */
++#define CLK_KEEP_REQ_RATE	BIT(12) /* keep reqrate on parent rate change */
+ 
+ struct clk;
+ struct clk_hw;

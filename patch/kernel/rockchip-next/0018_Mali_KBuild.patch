@@ -1,0 +1,13 @@
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index e0606c0..2df9e00 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -24,6 +24,8 @@ source "drivers/gpu/ipu-v3/Kconfig"
+ 
+ source "drivers/gpu/drm/Kconfig"
+ 
++source "drivers/gpu/arm/midgard/Kconfig"
++
+ menu "Frame buffer Devices"
+ source "drivers/video/fbdev/Kconfig"
+ endmenu

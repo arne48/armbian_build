@@ -1,0 +1,3714 @@
+diff --git a/drivers/clk/rockchip/clk.c b/drivers/clk/rockchip/clk.c
+index 9b6c818..67f370d 100644
+--- a/drivers/clk/rockchip/clk.c
++++ b/drivers/clk/rockchip/clk.c
+@@ -2,6 +2,9 @@
+  * Copyright (c) 2014 MundoReader S.L.
+  * Author: Heiko Stuebner <heiko@sntech.de>
+  *
++ * Copyright (c) 2016 Rockchip Electronics Co. Ltd.
++ * Author: Xing Zheng <zhengxing@rock-chips.com>
++ *
+  * based on
+  *
+  * samsung/clk.c
+@@ -109,22 +112,83 @@ err_gate:
+ 	return ERR_PTR(-ENOMEM);
+ }
+ 
+-static struct clk *rockchip_clk_register_frac_branch(const char *name,
++struct rockchip_clk_frac {
++	struct notifier_block			clk_nb;
++	struct clk_fractional_divider		div;
++	struct clk_gate				gate;
++
++	struct clk_mux				mux;
++	const struct clk_ops			*mux_ops;
++	int					mux_frac_idx;
++
++	bool					rate_change_remuxed;
++	int					rate_change_idx;
++};
++
++#define to_rockchip_clk_frac_nb(nb) \
++			container_of(nb, struct rockchip_clk_frac, clk_nb)
++
++static int rockchip_clk_frac_notifier_cb(struct notifier_block *nb,
++					 unsigned long event, void *data)
++{
++	struct clk_notifier_data *ndata = data;
++	struct rockchip_clk_frac *frac = to_rockchip_clk_frac_nb(nb);
++	struct clk_mux *frac_mux = &frac->mux;
++	int ret = 0;
++
++	pr_debug("%s: event %lu, old_rate %lu, new_rate: %lu\n",
++		 __func__, event, ndata->old_rate, ndata->new_rate);
++	if (event == PRE_RATE_CHANGE) {
++		frac->rate_change_idx = frac->mux_ops->get_parent(&frac_mux->hw);
++		if (frac->rate_change_idx != frac->mux_frac_idx) {
++			frac->mux_ops->set_parent(&frac_mux->hw, frac->mux_frac_idx);
++			frac->rate_change_remuxed = 1;
++		}
++	} else if (event == POST_RATE_CHANGE) {
++		/*
++		 * The POST_RATE_CHANGE notifier runs directly after the
++		 * divider clock is set in clk_change_rate, so we'll have
++		 * remuxed back to the original parent before clk_change_rate
++		 * reaches the mux itself.
++		 */
++		if (frac->rate_change_remuxed) {
++			frac->mux_ops->set_parent(&frac_mux->hw, frac->rate_change_idx);
++			frac->rate_change_remuxed = 0;
++		}
++	}
++
++	return notifier_from_errno(ret);
++}
++
++static struct clk *rockchip_clk_register_frac_branch(
++		struct rockchip_clk_provider *ctx, const char *name,
+ 		const char *const *parent_names, u8 num_parents,
+ 		void __iomem *base, int muxdiv_offset, u8 div_flags,
+ 		int gate_offset, u8 gate_shift, u8 gate_flags,
+-		unsigned long flags, spinlock_t *lock)
++		unsigned long flags, struct rockchip_clk_branch *child,
++		spinlock_t *lock)
+ {
++	struct rockchip_clk_frac *frac;
+ 	struct clk *clk;
+ 	struct clk_gate *gate = NULL;
+ 	struct clk_fractional_divider *div = NULL;
+ 	const struct clk_ops *div_ops = NULL, *gate_ops = NULL;
+ 
+-	if (gate_offset >= 0) {
+-		gate = kzalloc(sizeof(*gate), GFP_KERNEL);
+-		if (!gate)
+-			return ERR_PTR(-ENOMEM);
++	if (muxdiv_offset < 0)
++		return ERR_PTR(-EINVAL);
++
++	if (child && child->branch_type != branch_mux) {
++		pr_err("%s: fractional child clock for %s can only be a mux\n",
++		       __func__, name);
++		return ERR_PTR(-EINVAL);
++	}
++
++	frac = kzalloc(sizeof(*frac), GFP_KERNEL);
++	if (!frac)
++		return ERR_PTR(-ENOMEM);
+ 
++	if (gate_offset >= 0) {
++		gate = &frac->gate;
+ 		gate->flags = gate_flags;
+ 		gate->reg = base + gate_offset;
+ 		gate->bit_idx = gate_shift;
+@@ -132,13 +196,7 @@ static struct clk *rockchip_clk_register_frac_branch(const char *name,
+ 		gate_ops = &clk_gate_ops;
+ 	}
+ 
+-	if (muxdiv_offset < 0)
+-		return ERR_PTR(-EINVAL);
+-
+-	div = kzalloc(sizeof(*div), GFP_KERNEL);
+-	if (!div)
+-		return ERR_PTR(-ENOMEM);
+-
++	div = &frac->div;
+ 	div->flags = div_flags;
+ 	div->reg = base + muxdiv_offset;
+ 	div->mshift = 16;
+@@ -154,71 +212,198 @@ static struct clk *rockchip_clk_register_frac_branch(const char *name,
+ 				     NULL, NULL,
+ 				     &div->hw, div_ops,
+ 				     gate ? &gate->hw : NULL, gate_ops,
+-				     flags);
++				     flags | CLK_SET_RATE_UNGATE);
++	if (IS_ERR(clk)) {
++		kfree(frac);
++		return clk;
++	}
++
++	if (child) {
++		struct clk_mux *frac_mux = &frac->mux;
++		struct clk_init_data init;
++		struct clk *mux_clk;
++		int i, ret;
++
++		frac->mux_frac_idx = -1;
++		for (i = 0; i < child->num_parents; i++) {
++			if (!strcmp(name, child->parent_names[i])) {
++				pr_debug("%s: found fractional parent in mux at pos %d\n",
++					 __func__, i);
++				frac->mux_frac_idx = i;
++				break;
++			}
++		}
++
++		frac->mux_ops = &clk_mux_ops;
++		frac->clk_nb.notifier_call = rockchip_clk_frac_notifier_cb;
++
++		frac_mux->reg = base + child->muxdiv_offset;
++		frac_mux->shift = child->mux_shift;
++		frac_mux->mask = BIT(child->mux_width) - 1;
++		frac_mux->flags = child->mux_flags;
++		frac_mux->lock = lock;
++		frac_mux->hw.init = &init;
++
++		init.name = child->name;
++		init.flags = child->flags | CLK_SET_RATE_PARENT;
++		init.ops = frac->mux_ops;
++		init.parent_names = child->parent_names;
++		init.num_parents = child->num_parents;
++
++		mux_clk = clk_register(NULL, &frac_mux->hw);
++		if (IS_ERR(mux_clk))
++			return clk;
++
++		rockchip_clk_add_lookup(ctx, mux_clk, child->id);
++
++		/* notifier on the fraction divider to catch rate changes */
++		if (frac->mux_frac_idx >= 0) {
++			ret = clk_notifier_register(clk, &frac->clk_nb);
++			if (ret)
++				pr_err("%s: failed to register clock notifier for %s\n",
++						__func__, name);
++		} else {
++			pr_warn("%s: could not find %s as parent of %s, rate changes may not work\n",
++				__func__, name, child->name);
++		}
++	}
+ 
+ 	return clk;
+ }
+ 
+-static DEFINE_SPINLOCK(clk_lock);
+-static struct clk **clk_table;
+-static void __iomem *reg_base;
+-static struct clk_onecell_data clk_data;
+-static struct device_node *cru_node;
+-static struct regmap *grf;
++static struct clk *rockchip_clk_register_factor_branch(const char *name,
++		const char *const *parent_names, u8 num_parents,
++		void __iomem *base, unsigned int mult, unsigned int div,
++		int gate_offset, u8 gate_shift, u8 gate_flags,
++		unsigned long flags, spinlock_t *lock)
++{
++	struct clk *clk;
++	struct clk_gate *gate = NULL;
++	struct clk_fixed_factor *fix = NULL;
++
++	/* without gate, register a simple factor clock */
++	if (gate_offset == 0) {
++		return clk_register_fixed_factor(NULL, name,
++				parent_names[0], flags, mult,
++				div);
++	}
++
++	gate = kzalloc(sizeof(*gate), GFP_KERNEL);
++	if (!gate)
++		return ERR_PTR(-ENOMEM);
++
++	gate->flags = gate_flags;
++	gate->reg = base + gate_offset;
++	gate->bit_idx = gate_shift;
++	gate->lock = lock;
++
++	fix = kzalloc(sizeof(*fix), GFP_KERNEL);
++	if (!fix) {
++		kfree(gate);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	fix->mult = mult;
++	fix->div = div;
++
++	clk = clk_register_composite(NULL, name, parent_names, num_parents,
++				     NULL, NULL,
++				     &fix->hw, &clk_fixed_factor_ops,
++				     &gate->hw, &clk_gate_ops, flags);
++	if (IS_ERR(clk)) {
++		kfree(fix);
++		kfree(gate);
++	}
+ 
+-void __init rockchip_clk_init(struct device_node *np, void __iomem *base,
+-			      unsigned long nr_clks)
++	return clk;
++}
++
++struct rockchip_clk_provider * __init rockchip_clk_init(struct device_node *np,
++			void __iomem *base, unsigned long nr_clks)
+ {
+-	reg_base = base;
+-	cru_node = np;
+-	grf = ERR_PTR(-EPROBE_DEFER);
++	struct rockchip_clk_provider *ctx;
++	struct clk **clk_table;
++	int i;
++
++	ctx = kzalloc(sizeof(struct rockchip_clk_provider), GFP_KERNEL);
++	if (!ctx) {
++		pr_err("%s: Could not allocate clock provider context\n",
++			__func__);
++		return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	clk_table = kcalloc(nr_clks, sizeof(struct clk *), GFP_KERNEL);
+-	if (!clk_table)
+-		pr_err("%s: could not allocate clock lookup table\n", __func__);
++	if (!clk_table) {
++		pr_err("%s: Could not allocate clock lookup table\n",
++			__func__);
++		goto err_free;
++	}
++
++	for (i = 0; i < nr_clks; ++i)
++		clk_table[i] = ERR_PTR(-ENOENT);
++
++	ctx->reg_base = base;
++	ctx->clk_data.clks = clk_table;
++	ctx->clk_data.clk_num = nr_clks;
++	ctx->cru_node = np;
++	ctx->grf = ERR_PTR(-EPROBE_DEFER);
++	spin_lock_init(&ctx->lock);
+ 
+-	clk_data.clks = clk_table;
+-	clk_data.clk_num = nr_clks;
+-	of_clk_add_provider(np, of_clk_src_onecell_get, &clk_data);
++	return ctx;
++
++err_free:
++	kfree(ctx);
++	return ERR_PTR(-ENOMEM);
++}
++
++void __init rockchip_clk_of_add_provider(struct device_node *np,
++				struct rockchip_clk_provider *ctx)
++{
++	if (of_clk_add_provider(np, of_clk_src_onecell_get,
++				&ctx->clk_data))
++		pr_err("%s: could not register clk provider\n", __func__);
+ }
+ 
+-struct regmap *rockchip_clk_get_grf(void)
++struct regmap *rockchip_clk_get_grf(struct rockchip_clk_provider *ctx)
+ {
+-	if (IS_ERR(grf))
+-		grf = syscon_regmap_lookup_by_phandle(cru_node, "rockchip,grf");
+-	return grf;
++	if (IS_ERR(ctx->grf))
++		ctx->grf = syscon_regmap_lookup_by_phandle(ctx->cru_node, "rockchip,grf");
++	return ctx->grf;
+ }
+ 
+-void rockchip_clk_add_lookup(struct clk *clk, unsigned int id)
++void rockchip_clk_add_lookup(struct rockchip_clk_provider *ctx,
++			     struct clk *clk, unsigned int id)
+ {
+-	if (clk_table && id)
+-		clk_table[id] = clk;
++	if (ctx->clk_data.clks && id)
++		ctx->clk_data.clks[id] = clk;
+ }
+ 
+-void __init rockchip_clk_register_plls(struct rockchip_pll_clock *list,
++void __init rockchip_clk_register_plls(struct rockchip_clk_provider *ctx,
++				struct rockchip_pll_clock *list,
+ 				unsigned int nr_pll, int grf_lock_offset)
+ {
+ 	struct clk *clk;
+ 	int idx;
+ 
+ 	for (idx = 0; idx < nr_pll; idx++, list++) {
+-		clk = rockchip_clk_register_pll(list->type, list->name,
++		clk = rockchip_clk_register_pll(ctx, list->type, list->name,
+ 				list->parent_names, list->num_parents,
+-				reg_base, list->con_offset, grf_lock_offset,
++				list->con_offset, grf_lock_offset,
+ 				list->lock_shift, list->mode_offset,
+ 				list->mode_shift, list->rate_table,
+-				list->pll_flags, &clk_lock);
++				list->flags, list->pll_flags, list->id);
+ 		if (IS_ERR(clk)) {
+ 			pr_err("%s: failed to register clock %s\n", __func__,
+ 				list->name);
+ 			continue;
+ 		}
+ 
+-		rockchip_clk_add_lookup(clk, list->id);
++		rockchip_clk_add_lookup(ctx, clk, list->id);
+ 	}
+ }
+ 
+ void __init rockchip_clk_register_branches(
++				      struct rockchip_clk_provider *ctx,
+ 				      struct rockchip_clk_branch *list,
+ 				      unsigned int nr_clk)
+ {
+@@ -234,55 +419,56 @@ void __init rockchip_clk_register_branches(
+ 		case branch_mux:
+ 			clk = clk_register_mux(NULL, list->name,
+ 				list->parent_names, list->num_parents,
+-				flags, reg_base + list->muxdiv_offset,
++				flags, ctx->reg_base + list->muxdiv_offset,
+ 				list->mux_shift, list->mux_width,
+-				list->mux_flags, &clk_lock);
++				list->mux_flags, &ctx->lock);
+ 			break;
+ 		case branch_divider:
+ 			if (list->div_table)
+ 				clk = clk_register_divider_table(NULL,
+ 					list->name, list->parent_names[0],
+-					flags, reg_base + list->muxdiv_offset,
++					flags, ctx->reg_base + list->muxdiv_offset,
+ 					list->div_shift, list->div_width,
+ 					list->div_flags, list->div_table,
+-					&clk_lock);
++					&ctx->lock);
+ 			else
+ 				clk = clk_register_divider(NULL, list->name,
+ 					list->parent_names[0], flags,
+-					reg_base + list->muxdiv_offset,
++					ctx->reg_base + list->muxdiv_offset,
+ 					list->div_shift, list->div_width,
+-					list->div_flags, &clk_lock);
++					list->div_flags, &ctx->lock);
+ 			break;
+ 		case branch_fraction_divider:
+-			clk = rockchip_clk_register_frac_branch(list->name,
++			clk = rockchip_clk_register_frac_branch(ctx, list->name,
+ 				list->parent_names, list->num_parents,
+-				reg_base, list->muxdiv_offset, list->div_flags,
++				ctx->reg_base, list->muxdiv_offset, list->div_flags,
+ 				list->gate_offset, list->gate_shift,
+-				list->gate_flags, flags, &clk_lock);
++				list->gate_flags, flags, list->child,
++				&ctx->lock);
+ 			break;
+ 		case branch_gate:
+ 			flags |= CLK_SET_RATE_PARENT;
+ 
+ 			clk = clk_register_gate(NULL, list->name,
+ 				list->parent_names[0], flags,
+-				reg_base + list->gate_offset,
+-				list->gate_shift, list->gate_flags, &clk_lock);
++				ctx->reg_base + list->gate_offset,
++				list->gate_shift, list->gate_flags, &ctx->lock);
+ 			break;
+ 		case branch_composite:
+ 			clk = rockchip_clk_register_branch(list->name,
+ 				list->parent_names, list->num_parents,
+-				reg_base, list->muxdiv_offset, list->mux_shift,
++				ctx->reg_base, list->muxdiv_offset, list->mux_shift,
+ 				list->mux_width, list->mux_flags,
+ 				list->div_shift, list->div_width,
+ 				list->div_flags, list->div_table,
+ 				list->gate_offset, list->gate_shift,
+-				list->gate_flags, flags, &clk_lock);
++				list->gate_flags, flags, &ctx->lock);
+ 			break;
+ 		case branch_mmc:
+ 			clk = rockchip_clk_register_mmc(
+ 				list->name,
+ 				list->parent_names, list->num_parents,
+-				reg_base + list->muxdiv_offset,
++				ctx->reg_base + list->muxdiv_offset,
+ 				list->div_shift
+ 			);
+ 			break;
+@@ -290,8 +476,16 @@ void __init rockchip_clk_register_branches(
+ 			clk = rockchip_clk_register_inverter(
+ 				list->name, list->parent_names,
+ 				list->num_parents,
+-				reg_base + list->muxdiv_offset,
+-				list->div_shift, list->div_flags, &clk_lock);
++				ctx->reg_base + list->muxdiv_offset,
++				list->div_shift, list->div_flags, &ctx->lock);
++			break;
++		case branch_factor:
++			clk = rockchip_clk_register_factor_branch(
++				list->name, list->parent_names,
++				list->num_parents, ctx->reg_base,
++				list->div_shift, list->div_width,
++				list->gate_offset, list->gate_shift,
++				list->gate_flags, flags, &ctx->lock);
+ 			break;
+ 		}
+ 
+@@ -308,11 +502,12 @@ void __init rockchip_clk_register_branches(
+ 			continue;
+ 		}
+ 
+-		rockchip_clk_add_lookup(clk, list->id);
++		rockchip_clk_add_lookup(ctx, clk, list->id);
+ 	}
+ }
+ 
+-void __init rockchip_clk_register_armclk(unsigned int lookup_id,
++void __init rockchip_clk_register_armclk(struct rockchip_clk_provider *ctx,
++			unsigned int lookup_id,
+ 			const char *name, const char *const *parent_names,
+ 			u8 num_parents,
+ 			const struct rockchip_cpuclk_reg_data *reg_data,
+@@ -322,15 +517,15 @@ void __init rockchip_clk_register_armclk(unsigned int lookup_id,
+ 	struct clk *clk;
+ 
+ 	clk = rockchip_clk_register_cpuclk(name, parent_names, num_parents,
+-					   reg_data, rates, nrates, reg_base,
+-					   &clk_lock);
++					   reg_data, rates, nrates, ctx->reg_base,
++					   &ctx->lock);
+ 	if (IS_ERR(clk)) {
+ 		pr_err("%s: failed to register clock %s: %ld\n",
+ 		       __func__, name, PTR_ERR(clk));
+ 		return;
+ 	}
+ 
+-	rockchip_clk_add_lookup(clk, lookup_id);
++	rockchip_clk_add_lookup(ctx, clk, lookup_id);
+ }
+ 
+ void __init rockchip_clk_protect_critical(const char *const clocks[],
+@@ -347,11 +542,16 @@ void __init rockchip_clk_protect_critical(const char *const clocks[],
+ 	}
+ }
+ 
++static void __iomem *rst_base;
+ static unsigned int reg_restart;
++static void (*cb_restart)(void);
+ static int rockchip_restart_notify(struct notifier_block *this,
+ 				   unsigned long mode, void *cmd)
+ {
+-	writel(0xfdb9, reg_base + reg_restart);
++	if (cb_restart)
++		cb_restart();
++
++	writel(0xfdb9, rst_base + reg_restart);
+ 	return NOTIFY_DONE;
+ }
+ 
+@@ -360,11 +560,14 @@ static struct notifier_block rockchip_restart_handler = {
+ 	.priority = 128,
+ };
+ 
+-void __init rockchip_register_restart_notifier(unsigned int reg)
++void __init rockchip_register_restart_notifier(struct rockchip_clk_provider *ctx,
++					       unsigned int reg, void (*cb)(void))
+ {
+ 	int ret;
+ 
++	rst_base = ctx->reg_base;
+ 	reg_restart = reg;
++	cb_restart = cb;
+ 	ret = register_restart_handler(&rockchip_restart_handler);
+ 	if (ret)
+ 		pr_err("%s: cannot register restart handler, %d\n",
+diff --git a/drivers/clk/rockchip/clk.h b/drivers/clk/rockchip/clk.h
+index dc8ecb2..901d189 100644
+--- a/drivers/clk/rockchip/clk.h
++++ b/drivers/clk/rockchip/clk.h
+@@ -2,6 +2,9 @@
+  * Copyright (c) 2014 MundoReader S.L.
+  * Author: Heiko Stuebner <heiko@sntech.de>
+  *
++ * Copyright (c) 2015 Rockchip Electronics Co. Ltd.
++ * Author: Xing Zheng <zhengxing@rock-chips.com>
++ *
+  * based on
+  *
+  * samsung/clk.h
+@@ -24,13 +27,14 @@
+ #define CLK_ROCKCHIP_CLK_H
+ 
+ #include <linux/io.h>
++#include <linux/clk-provider.h>
+ 
+ struct clk;
+ 
+ #define HIWORD_UPDATE(val, mask, shift) \
+ 		((val) << (shift) | (mask) << ((shift) + 16))
+ 
+-/* register positions shared by RK2928, RK3066 and RK3188 */
++/* register positions shared by RK2928, RK3036, RK3066, RK3188 and RK3228 */
+ #define RK2928_PLL_CON(x)		((x) * 0x4)
+ #define RK2928_MODE_CON		0x40
+ #define RK2928_CLKSEL_CON(x)	((x) * 0x4 + 0x44)
+@@ -40,6 +44,22 @@ struct clk;
+ #define RK2928_SOFTRST_CON(x)	((x) * 0x4 + 0x110)
+ #define RK2928_MISC_CON		0x134
+ 
++#define RK3036_SDMMC_CON0		0x144
++#define RK3036_SDMMC_CON1		0x148
++#define RK3036_SDIO_CON0		0x14c
++#define RK3036_SDIO_CON1		0x150
++#define RK3036_EMMC_CON0		0x154
++#define RK3036_EMMC_CON1		0x158
++
++#define RK3228_GLB_SRST_FST		0x1f0
++#define RK3228_GLB_SRST_SND		0x1f4
++#define RK3228_SDMMC_CON0		0x1c0
++#define RK3228_SDMMC_CON1		0x1c4
++#define RK3228_SDIO_CON0		0x1c8
++#define RK3228_SDIO_CON1		0x1cc
++#define RK3228_EMMC_CON0		0x1d8
++#define RK3228_EMMC_CON1		0x1dc
++
+ #define RK3288_PLL_CON(x)		RK2928_PLL_CON(x)
+ #define RK3288_MODE_CON			0x50
+ #define RK3288_CLKSEL_CON(x)		((x) * 0x4 + 0x60)
+@@ -73,10 +93,47 @@ struct clk;
+ #define RK3368_EMMC_CON0		0x418
+ #define RK3368_EMMC_CON1		0x41c
+ 
++#define RK3399_PLL_CON(x)		RK2928_PLL_CON(x)
++#define RK3399_CLKSEL_CON(x)		((x) * 0x4 + 0x100)
++#define RK3399_CLKGATE_CON(x)		((x) * 0x4 + 0x300)
++#define RK3399_SOFTRST_CON(x)		((x) * 0x4 + 0x400)
++#define RK3399_GLB_SRST_FST		0x500
++#define RK3399_GLB_SRST_SND		0x504
++#define RK3399_GLB_CNT_TH		0x508
++#define RK3399_MISC_CON			0x50c
++#define RK3399_RST_CON			0x510
++#define RK3399_RST_ST			0x514
++#define RK3399_SDMMC_CON0		0x580
++#define RK3399_SDMMC_CON1		0x584
++#define RK3399_SDIO_CON0		0x588
++#define RK3399_SDIO_CON1		0x58c
++
++#define RK3399_PMU_PLL_CON(x)		RK2928_PLL_CON(x)
++#define RK3399_PMU_CLKSEL_CON(x)	((x) * 0x4 + 0x80)
++#define RK3399_PMU_CLKGATE_CON(x)	((x) * 0x4 + 0x100)
++#define RK3399_PMU_SOFTRST_CON(x)	((x) * 0x4 + 0x110)
++#define RK3399_PMU_RSTNHOLD_CON(x)	((x) * 0x4 + 0x120)
++#define RK3399_PMU_GATEDIS_CON(x)	((x) * 0x4 + 0x130)
++
+ enum rockchip_pll_type {
++	pll_rk3036,
+ 	pll_rk3066,
++	pll_rk3366,
++	pll_rk3399,
+ };
+ 
++#define RK3036_PLL_RATE(_rate, _refdiv, _fbdiv, _postdiv1,	\
++			_postdiv2, _dsmpd, _frac)		\
++{								\
++	.rate	= _rate##U,					\
++	.fbdiv = _fbdiv,					\
++	.postdiv1 = _postdiv1,					\
++	.refdiv = _refdiv,					\
++	.postdiv2 = _postdiv2,					\
++	.dsmpd = _dsmpd,					\
++	.frac = _frac,						\
++}
++
+ #define RK3066_PLL_RATE(_rate, _nr, _nf, _no)	\
+ {						\
+ 	.rate	= _rate##U,			\
+@@ -95,19 +152,43 @@ enum rockchip_pll_type {
+ 	.nb = _nb,						\
+ }
+ 
++/**
++ * struct rockchip_clk_provider - information about clock provider
++ * @reg_base: virtual address for the register base.
++ * @clk_data: holds clock related data like clk* and number of clocks.
++ * @cru_node: device-node of the clock-provider
++ * @grf: regmap of the general-register-files syscon
++ * @lock: maintains exclusion between callbacks for a given clock-provider.
++ */
++struct rockchip_clk_provider {
++	void __iomem *reg_base;
++	struct clk_onecell_data clk_data;
++	struct device_node *cru_node;
++	struct regmap *grf;
++	spinlock_t lock;
++};
++
+ struct rockchip_pll_rate_table {
+ 	unsigned long rate;
+ 	unsigned int nr;
+ 	unsigned int nf;
+ 	unsigned int no;
+ 	unsigned int nb;
++	/* for RK3036/RK3399 */
++	unsigned int fbdiv;
++	unsigned int postdiv1;
++	unsigned int refdiv;
++	unsigned int postdiv2;
++	unsigned int dsmpd;
++	unsigned int frac;
+ };
+ 
+ /**
+- * struct rockchip_pll_clock: information about pll clock
++ * struct rockchip_pll_clock - information about pll clock
+  * @id: platform specific id of the clock.
+  * @name: name of this pll clock.
+- * @parent_name: name of the parent clock.
++ * @parent_names: name of the parent clock.
++ * @num_parents: number of parents
+  * @flags: optional flags for basic clock.
+  * @con_offset: offset of the register for configuring the PLL.
+  * @mode_offset: offset of the register for configuring the PLL-mode.
+@@ -155,12 +236,13 @@ struct rockchip_pll_clock {
+ 		.rate_table	= _rtable,				\
+ 	}
+ 
+-struct clk *rockchip_clk_register_pll(enum rockchip_pll_type pll_type,
++struct clk *rockchip_clk_register_pll(struct rockchip_clk_provider *ctx,
++		enum rockchip_pll_type pll_type,
+ 		const char *name, const char *const *parent_names,
+-		u8 num_parents, void __iomem *base, int con_offset,
+-		int grf_lock_offset, int lock_shift, int reg_mode,
+-		int mode_shift, struct rockchip_pll_rate_table *rate_table,
+-		u8 clk_pll_flags, spinlock_t *lock);
++		u8 num_parents, int con_offset, int grf_lock_offset,
++		int lock_shift, int mode_offset, int mode_shift,
++		struct rockchip_pll_rate_table *rate_table,
++		unsigned long flags, u8 clk_pll_flags, u8 id);
+ 
+ struct rockchip_cpuclk_clksel {
+ 	int reg;
+@@ -174,18 +256,23 @@ struct rockchip_cpuclk_rate_table {
+ };
+ 
+ /**
+- * struct rockchip_cpuclk_reg_data: describes register offsets and masks of the cpuclock
++ * struct rockchip_cpuclk_reg_data - describes register offsets and masks of the cpuclock
+  * @core_reg:		register offset of the core settings register
+  * @div_core_shift:	core divider offset used to divide the pll value
+  * @div_core_mask:	core divider mask
++ * @mux_core_alt:	mux value to select alternate parent
++ * @mux_core_main:	mux value to select main parent of core
+  * @mux_core_shift:	offset of the core multiplexer
++ * @mux_core_mask:	core multiplexer mask
+  */
+ struct rockchip_cpuclk_reg_data {
+ 	int		core_reg;
+ 	u8		div_core_shift;
+ 	u32		div_core_mask;
+-	int		mux_core_reg;
++	u8		mux_core_alt;
++	u8		mux_core_main;
+ 	u8		mux_core_shift;
++	u32		mux_core_mask;
+ };
+ 
+ struct clk *rockchip_clk_register_cpuclk(const char *name,
+@@ -215,6 +302,7 @@ enum rockchip_clk_branch_type {
+ 	branch_gate,
+ 	branch_mmc,
+ 	branch_inverter,
++	branch_factor,
+ };
+ 
+ struct rockchip_clk_branch {
+@@ -235,6 +323,7 @@ struct rockchip_clk_branch {
+ 	int				gate_offset;
+ 	u8				gate_shift;
+ 	u8				gate_flags;
++	struct rockchip_clk_branch	*child;
+ };
+ 
+ #define COMPOSITE(_id, cname, pnames, f, mo, ms, mw, mf, ds, dw,\
+@@ -369,6 +458,40 @@ struct rockchip_clk_branch {
+ 		.gate_flags	= gf,				\
+ 	}
+ 
++#define COMPOSITE_FRACMUX(_id, cname, pname, f, mo, df, go, gs, gf, ch) \
++	{							\
++		.id		= _id,				\
++		.branch_type	= branch_fraction_divider,	\
++		.name		= cname,			\
++		.parent_names	= (const char *[]){ pname },	\
++		.num_parents	= 1,				\
++		.flags		= f,				\
++		.muxdiv_offset	= mo,				\
++		.div_shift	= 16,				\
++		.div_width	= 16,				\
++		.div_flags	= df,				\
++		.gate_offset	= go,				\
++		.gate_shift	= gs,				\
++		.gate_flags	= gf,				\
++		.child		= ch,				\
++	}
++
++#define COMPOSITE_FRACMUX_NOGATE(_id, cname, pname, f, mo, df, ch) \
++	{							\
++		.id		= _id,				\
++		.branch_type	= branch_fraction_divider,	\
++		.name		= cname,			\
++		.parent_names	= (const char *[]){ pname },	\
++		.num_parents	= 1,				\
++		.flags		= f,				\
++		.muxdiv_offset	= mo,				\
++		.div_shift	= 16,				\
++		.div_width	= 16,				\
++		.div_flags	= df,				\
++		.gate_offset	= -1,				\
++		.child		= ch,				\
++	}
++
+ #define MUX(_id, cname, pnames, f, o, s, w, mf)			\
+ 	{							\
+ 		.id		= _id,				\
+@@ -450,21 +573,55 @@ struct rockchip_clk_branch {
+ 		.div_flags	= if,				\
+ 	}
+ 
+-void rockchip_clk_init(struct device_node *np, void __iomem *base,
+-		       unsigned long nr_clks);
+-struct regmap *rockchip_clk_get_grf(void);
+-void rockchip_clk_add_lookup(struct clk *clk, unsigned int id);
+-void rockchip_clk_register_branches(struct rockchip_clk_branch *clk_list,
++#define FACTOR(_id, cname, pname,  f, fm, fd)			\
++	{							\
++		.id		= _id,				\
++		.branch_type	= branch_factor,		\
++		.name		= cname,			\
++		.parent_names	= (const char *[]){ pname },	\
++		.num_parents	= 1,				\
++		.flags		= f,				\
++		.div_shift	= fm,				\
++		.div_width	= fd,				\
++	}
++
++#define FACTOR_GATE(_id, cname, pname,  f, fm, fd, go, gb, gf)	\
++	{							\
++		.id		= _id,				\
++		.branch_type	= branch_factor,		\
++		.name		= cname,			\
++		.parent_names	= (const char *[]){ pname },	\
++		.num_parents	= 1,				\
++		.flags		= f,				\
++		.div_shift	= fm,				\
++		.div_width	= fd,				\
++		.gate_offset	= go,				\
++		.gate_shift	= gb,				\
++		.gate_flags	= gf,				\
++	}
++
++struct rockchip_clk_provider *rockchip_clk_init(struct device_node *np,
++			void __iomem *base, unsigned long nr_clks);
++void rockchip_clk_of_add_provider(struct device_node *np,
++				struct rockchip_clk_provider *ctx);
++struct regmap *rockchip_clk_get_grf(struct rockchip_clk_provider *ctx);
++void rockchip_clk_add_lookup(struct rockchip_clk_provider *ctx,
++			     struct clk *clk, unsigned int id);
++void rockchip_clk_register_branches(struct rockchip_clk_provider *ctx,
++				    struct rockchip_clk_branch *list,
+ 				    unsigned int nr_clk);
+-void rockchip_clk_register_plls(struct rockchip_pll_clock *pll_list,
++void rockchip_clk_register_plls(struct rockchip_clk_provider *ctx,
++				struct rockchip_pll_clock *pll_list,
+ 				unsigned int nr_pll, int grf_lock_offset);
+-void rockchip_clk_register_armclk(unsigned int lookup_id, const char *name,
++void rockchip_clk_register_armclk(struct rockchip_clk_provider *ctx,
++			unsigned int lookup_id, const char *name,
+ 			const char *const *parent_names, u8 num_parents,
+ 			const struct rockchip_cpuclk_reg_data *reg_data,
+ 			const struct rockchip_cpuclk_rate_table *rates,
+ 			int nrates);
+ void rockchip_clk_protect_critical(const char *const clocks[], int nclocks);
+-void rockchip_register_restart_notifier(unsigned int reg);
++void rockchip_register_restart_notifier(struct rockchip_clk_provider *ctx,
++					unsigned int reg, void (*cb)(void));
+ 
+ #define ROCKCHIP_SOFTRST_HIWORD_MASK	BIT(0)
+ 
+diff --git a/include/dt-bindings/clock/rk3288-cru.h b/include/dt-bindings/clock/rk3288-cru.h
+index c719aac..3c82c64 100644
+--- a/include/dt-bindings/clock/rk3288-cru.h
++++ b/include/dt-bindings/clock/rk3288-cru.h
+@@ -86,6 +86,9 @@
+ #define SCLK_USBPHY480M_SRC	122
+ #define SCLK_PVTM_CORE		123
+ #define SCLK_PVTM_GPU		124
++#define SCLK_CRYPTO		125
++#define SCLK_MIPIDSI_24M	126
++#define SCLK_CIFOUT	127
+ 
+ #define SCLK_MAC		151
+ #define SCLK_MACREF_OUT		152
+@@ -164,6 +167,9 @@
+ #define PCLK_DDRUPCTL1		366
+ #define PCLK_PUBL1		367
+ #define PCLK_WDT		368
++#define PCLK_EFUSE256		369
++#define PCLK_EFUSE1024		370
++#define PCLK_ISP_IN		371
+ 
+ /* hclk gates */
+ #define HCLK_GPS		448
+diff --git a/include/dt-bindings/display/drm_mipi_dsi.h b/include/dt-bindings/display/drm_mipi_dsi.h
+new file mode 100644
+index 0000000..be39944
+--- /dev/null
++++ b/include/dt-bindings/display/drm_mipi_dsi.h
+@@ -0,0 +1,50 @@
++/*
++ * MIPI DSI Bus
++ *
++ * Copyright (c) Fuzhou Rockchip Electronics Co.Ltd
++ * Authors:
++ *       Mark Yao <yzq@rock-chips.com>
++ *
++ * based on include/drm/drm_mipi_dsi.h
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef _DRM_MIPI_DSI_H__
++#define _DRM_MIPI_DSI_H__
++
++/* DSI mode flags */
++
++/* video mode */
++#define MIPI_DSI_MODE_VIDEO		(1 << 0)
++/* video burst mode */
++#define MIPI_DSI_MODE_VIDEO_BURST	(1 << 1)
++/* video pulse mode */
++#define MIPI_DSI_MODE_VIDEO_SYNC_PULSE	(1 << 2)
++/* enable auto vertical count mode */
++#define MIPI_DSI_MODE_VIDEO_AUTO_VERT	(1 << 3)
++/* enable hsync-end packets in vsync-pulse and v-porch area */
++#define MIPI_DSI_MODE_VIDEO_HSE		(1 << 4)
++/* disable hfront-porch area */
++#define MIPI_DSI_MODE_VIDEO_HFP		(1 << 5)
++/* disable hback-porch area */
++#define MIPI_DSI_MODE_VIDEO_HBP		(1 << 6)
++/* disable hsync-active area */
++#define MIPI_DSI_MODE_VIDEO_HSA		(1 << 7)
++/* flush display FIFO on vsync pulse */
++#define MIPI_DSI_MODE_VSYNC_FLUSH	(1 << 8)
++/* disable EoT packets in HS mode */
++#define MIPI_DSI_MODE_EOT_PACKET	(1 << 9)
++/* device supports non-continuous clock behavior (DSI spec 5.6.1) */
++#define MIPI_DSI_CLOCK_NON_CONTINUOUS	(1 << 10)
++/* transmit data in low power */
++#define MIPI_DSI_MODE_LPM		(1 << 11)
++
++#define MIPI_DSI_FMT_RGB888		0
++#define MIPI_DSI_FMT_RGB666		1
++#define MIPI_DSI_FMT_RGB666_PACKED	2
++#define MIPI_DSI_FMT_RGB565		3
++
++#endif /* __DRM_MIPI_DSI__ */
+diff --git a/include/dt-bindings/display/mipi_dsi.h b/include/dt-bindings/display/mipi_dsi.h
+new file mode 100755
+index 0000000..07a2dce
+--- /dev/null
++++ b/include/dt-bindings/display/mipi_dsi.h
+@@ -0,0 +1,105 @@
++/*
++drivers/video/rockchip/transmitter/mipi_dsi.h
++*/
++#ifndef MIPI_DSI_H_
++#define MIPI_DSI_H_
++
++#ifdef CONFIG_MIPI_DSI_FT
++#include "..\..\common\config.h"
++#endif
++
++//DSI DATA TYPE
++#define DTYPE_DCS_SWRITE_0P		0x05 
++#define DTYPE_DCS_SWRITE_1P		0x15 
++#define DTYPE_DCS_LWRITE		0x39 
++#define DTYPE_GEN_LWRITE		0x29 
++#define DTYPE_GEN_SWRITE_2P		0x23 
++#define DTYPE_GEN_SWRITE_1P		0x13
++#define DTYPE_GEN_SWRITE_0P		0x03
++
++//command transmit mode
++#define HSDT			0x00
++#define LPDT			0x01
++
++//DSI DATA TYPE FLAG
++#define DATA_TYPE_DCS			0x00
++#define DATA_TYPE_GEN			0x01
++
++//Video Mode
++#define VM_NBMWSP		0x00  //Non burst mode with sync pulses
++#define VM_NBMWSE		0x01  //Non burst mode with sync events
++#define VM_BM			0x02  //Burst mode
++
++//Video Pixel Format
++#define VPF_16BPP		0x00
++#define VPF_18BPP		0x01	 //packed
++#define VPF_18BPPL		0x02     //loosely packed
++#define VPF_24BPP		0x03
++
++//Display Command Set
++#define dcs_enter_idle_mode 		0x39
++#define dcs_enter_invert_mode 		0x21
++#define dcs_enter_normal_mode 		0x13
++#define dcs_enter_partial_mode  	0x12
++#define dcs_enter_sleep_mode  		0x10
++#define dcs_exit_idle_mode  		0x38
++#define dcs_exit_invert_mode  		0x20
++#define dcs_exit_sleep_mode  		0x11
++#define dcs_get_address_mode  		0x0b
++#define dcs_get_blue_channel  		0x08
++#define dcs_get_diagnostic_result  	0x0f
++#define dcs_get_display_mode  		0x0d
++#define dcs_get_green_channel  		0x07
++#define dcs_get_pixel_format  		0x0c
++#define dcs_get_power_mode  		0x0a
++#define dcs_get_red_channel 		0x06
++#define dcs_get_scanline 	 		0x45
++#define dcs_get_signal_mode  		0x0e
++#define dcs_nop				 		0x00
++#define dcs_read_DDB_continue  		0xa8
++#define dcs_read_DDB_start  		0xa1
++#define dcs_read_memory_continue  	0x3e
++#define dcs_read_memory_start  		0x2e
++#define dcs_set_address_mode  		0x36
++#define dcs_set_column_address  	0x2a
++#define dcs_set_display_off  		0x28
++#define dcs_set_display_on  		0x29
++#define dcs_set_gamma_curve  		0x26
++#define dcs_set_page_address  		0x2b
++#define dcs_set_partial_area  		0x30
++#define dcs_set_pixel_format  		0x3a
++#define dcs_set_scroll_area  		0x33
++#define dcs_set_scroll_start  		0x37
++#define dcs_set_tear_off 	 		0x34
++#define dcs_set_tear_on 	 		0x35
++#define dcs_set_tear_scanline  		0x44
++#define dcs_soft_reset 		 		0x01
++#define dcs_write_LUT 		 		0x2d
++#define dcs_write_memory_continue  	0x3c
++#define dcs_write_memory_start 		0x2c
++
++#ifndef MHz
++#define MHz   1000000
++#endif
++
++
++#if 0
++typedef signed char s8;
++typedef unsigned char u8;
++
++typedef signed short s16;
++typedef unsigned short u16;
++
++typedef signed int s32;
++typedef unsigned int u32;
++
++typedef signed long s64;
++typedef unsigned long u64;
++#endif
++
++
++//iomux
++#define OLD_RK_IOMUX 0
++
++
++#endif /* end of MIPI_DSI_H_ */
+diff --git a/include/dt-bindings/display/rk_fb.h b/include/dt-bindings/display/rk_fb.h
+new file mode 100755
+index 0000000..0e7e805
+--- /dev/null
++++ b/include/dt-bindings/display/rk_fb.h
+@@ -0,0 +1,173 @@
++#ifndef _DT_BINDINGS_RKFB_H_
++#define _DT_BINDINGS_RKFB_H_
++#define GPIO 		0
++#define REGULATOR	1
++
++#define PRMRY		1		/*primary display device*/
++#define EXTEND		2		/*extend display device*/
++
++#define DISPLAY_SOURCE_LCDC0	0
++#define DISPLAY_SOURCE_LCDC1	1
++
++#define NO_DUAL		0
++#define ONE_DUAL	1
++#define DUAL		2
++#define DUAL_LCD	3
++/********************************************************************
++**          display output interface supported by rockchip	   **
++********************************************************************/
++#define OUT_P888            0	//24bit screen,connect to lcdc D0~D23
++#define OUT_P666            1	//18bit screen,connect to lcdc D0~D17
++#define OUT_P565            2
++#define OUT_S888x           4
++#define OUT_CCIR656         6
++#define OUT_S888            8
++#define OUT_S888DUMY        12
++#define OUT_YUV_420	    14
++#define OUT_P101010	    15
++#define OUT_YUV_420_10BIT   16
++#define OUT_YUV_422	    12
++#define OUT_YUV_422_10BIT   17
++#define OUT_P16BPP4         24
++#define OUT_D888_P666       0x21	//18bit screen,connect to lcdc D2~D7, D10~D15, D18~D23
++#define OUT_D888_P565       0x22
++
++#define SCREEN_NULL        0
++#define SCREEN_RGB	   1
++#define SCREEN_LVDS	   2
++#define SCREEN_DUAL_LVDS   3
++#define SCREEN_MCU         4
++#define SCREEN_TVOUT       5
++#define SCREEN_HDMI        6
++#define SCREEN_MIPI	   7
++#define SCREEN_DUAL_MIPI   8
++#define SCREEN_EDP         9
++#define SCREEN_TVOUT_TEST  10
++#define SCREEN_LVDS_10BIT	 11
++#define SCREEN_DUAL_LVDS_10BIT   12
++#define SCREEN_DP		13
++
++#define LVDS_8BIT_1     0
++#define LVDS_8BIT_2     1
++#define LVDS_8BIT_3     2
++#define LVDS_6BIT       3
++#define LVDS_10BIT_1    4
++#define LVDS_10BIT_2    5
++
++/* x y mirror or rotate mode */
++#define NO_MIRROR	0
++#define X_MIRROR	1 /* up-down flip*/
++#define Y_MIRROR	2 /* left-right flip */
++#define X_Y_MIRROR	3 /* the same as rotate 180 degrees */
++#define ROTATE_90	4 /* clockwise rotate 90 degrees */
++#define ROTATE_180	8 /* rotate 180 degrees
++			   * It is recommended to use X_Y_MIRROR
++			   * rather than ROTATE_180
++			   */
++#define ROTATE_270	12/* clockwise rotate 270 degrees */
++
++#define COLOR_RGB		0
++#define COLOR_RGB_BT2020	1
++/* default colorspace is bt601 */
++#define COLOR_YCBCR		2
++#define COLOR_YCBCR_BT709	3
++#define COLOR_YCBCR_BT2020	4
++
++#define IS_YUV_COLOR(x)                ((x) >= COLOR_YCBCR)
++
++/* fb win map */
++#define FB_DEFAULT_ORDER		0
++#define FB0_WIN2_FB1_WIN1_FB2_WIN0	12
++#define FB0_WIN1_FB1_WIN2_FB2_WIN0	21
++#define FB0_WIN2_FB1_WIN0_FB2_WIN1	102
++#define FB0_WIN0_FB1_WIN2_FB2_WIN1	120
++#define FB0_WIN0_FB1_WIN1_FB2_WIN2	210
++#define FB0_WIN1_FB1_WIN0_FB2_WIN2	201
++#define FB0_WIN0_FB1_WIN1_FB2_WIN2_FB3_WIN3	    3210
++#define FB0_WIN0_FB1_WIN1_FB2_WIN2_FB3_WIN3_FB4_HWC 43210
++
++#define DISPLAY_POLICY_SDK	0
++#define DISPLAY_POLICY_BOX	1
++
++/*      	lvds connect config       
++ *                                        
++ *          	LVDS_8BIT_1    LVDS_8BIT_2     LVDS_8BIT_3     LVDS_6BIT
++----------------------------------------------------------------------
++	TX0	R0		R2		R2		R0
++	TX1	R1		R3		R3		R1
++	TX2	R2		R4		R4		R2
++Y	TX3	R3		R5		R5		R3
++0	TX4	R4		R6		R6		R4
++	TX6	R5		R7		R7		R5	
++	TX7	G0		G2		G2		G0
++----------------------------------------------------------------------
++	TX8	G1		G3		G3		G1
++	TX9	G2		G4		G4		G2
++Y	TX12   	G3		G5		G5		G3
++1	TX13   	G4		G6		G6		G4
++ 	TX14   	G5		G7		G7		G5
++	TX15   	B0		B2		B2		B0
++	TX18   	B1		B3		B3		B1
++----------------------------------------------------------------------
++	TX19	B2		B4		B4		B2
++	TX20   	B3		B5		B5		B3
++	TX21   	B4		B6		B6		B4
++Y	TX22   	B5		B7		B7		B5
++2	TX24   	HSYNC		HSYNC		HSYNC		HSYNC
++	TX25	VSYNC		VSYNC		VSYNC		VSYNC
++	TX26	ENABLE		ENABLE		ENABLE		ENABLE
++----------------------------------------------------------------------    
++	TX27	R6		R0		GND		GND
++	TX5	R7		R1		GND		GND
++	TX10   	G6		G0		GND		GND
++Y	TX11   	G7		G1		GND		GND
++3	TX16   	B6		B0		GND		GND
++	TX17   	B7		B1		GND		GND
++	TX23   	RSVD		RSVD		RSVD		RSVD
++----------------------------------------------------------------------
++
++ *          	LVDS_10BIT_1    LVDS_10BIT_2
++----------------------------------------------------------------------
++	TX0	R0		R4
++	TX1	R1		R5
++	TX2	R2		R6
++Y	TX3	R3		R7
++0	TX4	R4		R8
++	TX6	R5		R9
++	TX7	G0		G4
++----------------------------------------------------------------------
++	TX8	G1		G5
++	TX9	G2		G6
++Y	TX12   	G3		G7
++1	TX13   	G4		G8
++	TX14   	G5		G9
++	TX15   	B0		B4
++	TX18   	B1		B5
++----------------------------------------------------------------------
++	TX19	B2		B6
++	TX20   	B3		B7
++	TX21   	B4		B8
++Y	TX22   	B5		B9
++2	TX24   	HSYNC		HSYNC
++        TX25	VSYNC		VSYNC
++	TX26	ENABLE		ENABLE
++----------------------------------------------------------------------
++	TX27	R6		R2
++	TX5	R7		R3
++	TX10   	G6		G2
++Y	TX11   	G7		G3
++3	TX16   	B6		B2
++	TX17   	B7		B3
++	TX23   	GND		GND
++----------------------------------------------------------------------
++	TX27	R8		R0
++	TX5	R9		R1
++	TX10   	G8		G0
++Y	TX11   	G9		G1
++4	TX16   	B8		B0
++	TX17   	B9		B1
++	TX23   	GND		GND
++------------------------------------------------------------------------
++*/
++
++#endif
+diff --git a/include/dt-bindings/display/screen-timing/lcd-86v-rgb1024x600.dtsi b/include/dt-bindings/display/screen-timing/lcd-86v-rgb1024x600.dtsi
+new file mode 100644
+index 0000000..bfad808
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-86v-rgb1024x600.dtsi
+@@ -0,0 +1,29 @@
++/*
++ * RockChip. LCD_RGB1024x600 FOR 86V
++ *
++ */
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        timing0: timing0 {
++		screen-type = <SCREEN_RGB>;
++		out-face    = <OUT_P666>;
++		clock-frequency = <60000000>;
++		hactive = <1024>;
++		vactive = <600>;
++		hback-porch = <100>;
++		hfront-porch = <120>;
++		vback-porch = <10>;
++		vfront-porch = <15>;
++		hsync-len = <100>;
++		vsync-len = <10>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-F402.dtsi b/include/dt-bindings/display/screen-timing/lcd-F402.dtsi
+new file mode 100644
+index 0000000..a3ad25f
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-F402.dtsi
+@@ -0,0 +1,123 @@
++/*
++ * RockChip. DisplayPort screen LP097QX1
++ *
++ */
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        timing0: timing0 {
++		screen-type = <SCREEN_EDP>;
++		out-face    = <OUT_P666>;
++		clock-frequency = <205000000>;
++		hactive = <1536>;
++		vactive = <2048>;
++		hback-porch = <48>;
++		hfront-porch = <12>;
++		vback-porch = <8>;
++		vfront-porch = <8>;
++		hsync-len = <16>;
++		vsync-len = <4>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <1>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++		dsp-lut = <0x00000000 0x00010101 0x00020202 0x00030303 0x00040404 0x00050505 0x00060606 0x00070707 0x00080808 0x00090909
++				0x000a0a0a 0x000b0b0b 0x000c0c0c 0x000d0d0d 0x000e0e0e 0x000f0f0f 0x00101010 0x00111111 0x00121212 0x00131313
++				0x00141414 0x00151515 0x00161616 0x00171717 0x00181818 0x00191919 0x001a1a1a 0x001b1b1b 0x001c1c1c 0x001d1d1d
++				0x001e1e1e 0x001f1f1f 0x00202020 0x00212121 0x00222222 0x00232323 0x00242424 0x00252525 0x00262626 0x00272727
++				0x00282828 0x00292929 0x002a2a2a 0x002b2b2b 0x002c2c2c 0x002d2d2d 0x002e2e2e 0x002f2f2f 0x00303030 0x00313131
++				0x00323232 0x00333333 0x00343434 0x00353535 0x00363636 0x00373737 0x00383838 0x00393939 0x003a3a3a 0x003b3b3b
++				0x003c3c3c 0x003d3d3d 0x003e3e3e 0x003f3f3f 0x00404040 0x00414141 0x00424242 0x00434343 0x00444444 0x00454545
++				0x00464646 0x00474747 0x00484848 0x00494949 0x004a4a4a 0x004b4b4b 0x004c4c4c 0x004d4d4d 0x004e4e4e 0x004f4f4f
++				0x00505050 0x00515151 0x00525252 0x00535353 0x00545454 0x00555555 0x00565656 0x00575757 0x00585858 0x00595959
++				0x005a5a5a 0x005b5b5b 0x005c5c5c 0x005d5d5d 0x005e5e5e 0x005f5f5f 0x00606060 0x00616161 0x00626262 0x00636363
++				0x00646464 0x00656565 0x00666666 0x00676767 0x00686868 0x00696969 0x006a6a6a 0x006b6b6b 0x006c6c6c 0x006d6d6d
++				0x006e6e6e 0x006f6f6f 0x00707070 0x00717171 0x00727272 0x00737373 0x00747474 0x00757575 0x00767676 0x00777777
++				0x00787878 0x00797979 0x007a7a7a 0x007b7b7b 0x007c7c7c 0x007d7d7d 0x007e7e7e 0x007f7f7f 0x00808080 0x00818181
++				0x00828282 0x00838383 0x00848484 0x00858585 0x00868686 0x00878787 0x00888888 0x00898989 0x008a8a8a 0x008b8b8b
++				0x008c8c8c 0x008d8d8d 0x008e8e8e 0x008f8f8f 0x00909090 0x00919191 0x00929292 0x00939393 0x00949494 0x00959595
++				0x00969696 0x00979797 0x00989898 0x00999999 0x009a9a9a 0x009b9b9b 0x009c9c9c 0x009d9d9d 0x009e9e9e 0x009f9f9f
++				0x00a0a0a0 0x00a1a1a1 0x00a2a2a2 0x00a3a3a3 0x00a4a4a4 0x00a5a5a5 0x00a6a6a6 0x00a7a7a7 0x00a8a8a8 0x00a9a9a9
++				0x00aaaaaa 0x00ababab 0x00acacac 0x00adadad 0x00aeaeae 0x00afafaf 0x00b0b0b0 0x00b1b1b1 0x00b2b2b2 0x00b3b3b3
++				0x00b4b4b4 0x00b5b5b5 0x00b6b6b6 0x00b7b7b7 0x00b8b8b8 0x00b9b9b9 0x00bababa 0x00bbbbbb 0x00bcbcbc 0x00bdbdbd
++				0x00bebebe 0x00bfbfbf 0x00c0c0c0 0x00c1c1c1 0x00c2c2c2 0x00c3c3c3 0x00c4c4c4 0x00c5c5c5 0x00c6c6c6 0x00c7c7c7
++				0x00c8c8c8 0x00c9c9c9 0x00cacaca 0x00cbcbcb 0x00cccccc 0x00cdcdcd 0x00cecece 0x00cfcfcf 0x00d0d0d0 0x00d1d1d1
++				0x00d2d2d2 0x00d3d3d3 0x00d4d4d4 0x00d5d5d5 0x00d6d6d6 0x00d7d7d7 0x00d8d8d8 0x00d9d9d9 0x00dadada 0x00dbdbdb
++				0x00dcdcdc 0x00dddddd 0x00dedede 0x00dfdfdf 0x00e0e0e0 0x00e1e1e1 0x00e2e2e2 0x00e3e3e3 0x00e4e4e4 0x00e5e5e5
++				0x00e6e6e6 0x00e7e7e7 0x00e8e8e8 0x00e9e9e9 0x00eaeaea 0x00ebebeb 0x00ececec 0x00ededed 0x00eeeeee 0x00efefef
++				0x00f0f0f0 0x00f1f1f1 0x00f2f2f2 0x00f3f3f3 0x00f4f4f4 0x00f5f5f5 0x00f6f6f6 0x00f7f7f7 0x00f8f8f8 0x00f9f9f9
++				0x00fafafa 0x00fbfbfb 0x00fcfcfc 0x00fdfdfd 0x00fefefe 0x00ffffff>;
++		cabc-lut = <
++			/*gamma = 2.2*/
++				0x00000383 0x00000392 0x000003a2 0x000003b2 0x000003c2 0x000003d2 0x000003e2 0x000003f3
++				0x00000403 0x00000414 0x00000425 0x00000436 0x00000447 0x00000458 0x0000046a 0x0000047b
++				0x0000048d 0x0000049f 0x000004b1 0x000004c3 0x000004d5 0x000004e8 0x000004fa 0x0000050d
++				0x00000520 0x00000533 0x00000546 0x0000055a 0x0000056d 0x00000581 0x00000595 0x000005a9
++				0x000005bd 0x000005d1 0x000005e5 0x000005fa 0x0000060f 0x00000624 0x00000639 0x0000064e
++				0x00000663 0x00000679 0x0000068e 0x000006a4 0x000006ba 0x000006d0 0x000006e6 0x000006fd
++				0x00000713 0x0000072a 0x00000741 0x00000758 0x0000076f 0x00000786 0x0000079e 0x000007b6
++				0x000007cd 0x000007e5 0x000007fd 0x00000816 0x0000082e 0x00000847 0x0000085f 0x00000878
++				0x00000891 0x000008ab 0x000008c4 0x000008de 0x000008f7 0x00000911 0x0000092b 0x00000945
++				0x00000960 0x0000097a 0x00000995 0x000009af 0x000009ca 0x000009e6 0x00000a01 0x00000a1c
++				0x00000a38 0x00000a54 0x00000a6f 0x00000a8c 0x00000aa8 0x00000ac4 0x00000ae1 0x00000afd
++				0x00000b1a 0x00000b37 0x00000b54 0x00000b72 0x00000b8f 0x00000bad 0x00000bcb 0x00000be9
++				0x00000c07 0x00000c25 0x00000c44 0x00000c62 0x00000c81 0x00000ca0 0x00000cbf 0x00000cdf
++				0x00000cfe 0x00000d1e 0x00000d3e 0x00000d5d 0x00000d7e 0x00000d9e 0x00000dbe 0x00000ddf
++				0x00000e00 0x00000e21 0x00000e42 0x00000e63 0x00000e84 0x00000ea6 0x00000ec8 0x00000eea
++				0x00000f0c 0x00000f2e 0x00000f50 0x00000f73 0x00000f96 0x00000fb9 0x00000fdc 0x00000fff
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++				0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000>;
++		cabc-gamma-base = <
++			/*gamma = 2.2*/
++			0x00010000 0x0000fdd0 0x0000fba8 0x0000f986 0x0000f76a 0x0000f556 0x0000f347 0x0000f140
++			0x0000ef3e 0x0000ed43 0x0000eb4e 0x0000e95e 0x0000e775 0x0000e592 0x0000e3b4 0x0000e1dc
++			0x0000e009 0x0000de3c 0x0000dc74 0x0000dab2 0x0000d8f4 0x0000d73c 0x0000d589 0x0000d3db
++			0x0000d232 0x0000d08d 0x0000ceee 0x0000cd53 0x0000cbbc 0x0000ca2b 0x0000c89d 0x0000c714
++			0x0000c590 0x0000c410 0x0000c294 0x0000c11c 0x0000bfa8 0x0000be39 0x0000bccd 0x0000bb65
++			0x0000ba01 0x0000b8a1 0x0000b745 0x0000b5ed 0x0000b498 0x0000b347 0x0000b1f9 0x0000b0af
++			0x0000af68 0x0000ae25 0x0000ace5 0x0000aba8 0x0000aa6f 0x0000a939 0x0000a806 0x0000a6d7
++			0x0000a5aa 0x0000a480 0x0000a35a 0x0000a236 0x0000a116 0x00009ff8 0x00009edd 0x00009dc5
++			0x00009cb0 0x00009b9e 0x00009a8e 0x00009981 0x00009877 0x0000976f 0x0000966a 0x00009567
++			0x00009467 0x0000936a 0x0000926f 0x00009176 0x00009080 0x00008f8c 0x00008e9a 0x00008dab
++			0x00008cbe 0x00008bd3 0x00008aea 0x00008a04 0x00008920 0x0000883e 0x0000875e 0x00008680
++			0x000085a4 0x000084ca 0x000083f3 0x0000831d 0x00008249 0x00008177 0x000080a7 0x00007fd9
++			0x00007f0d 0x00007e42 0x00007d7a 0x00007cb3 0x00007bee 0x00007b2b 0x00007a6a 0x000079aa
++			0x000078ec 0x0000782f 0x00007775 0x000076bc 0x00007604 0x0000754f 0x0000749a 0x000073e8
++			0x00007337 0x00007287 0x000071d9 0x0000712c 0x00007081 0x00006fd8 0x00006f30 0x00006e89
++			0x00006de4 0x00006d40 0x00006c9d 0x00006bfc 0x00006b5c 0x00006abe 0x00006a21 0x00006985
++			0x000068ea 0x00006851 0x000067b9 0x00006722 0x0000668d 0x000065f9 0x00006566 0x000064d4
++			0x00006443 0x000063b4 0x00006325 0x00006298 0x0000620c 0x00006181 0x000060f8 0x0000606f
++			0x00005fe7 0x00005f61 0x00005edb 0x00005e57 0x00005dd4 0x00005d51 0x00005cd0 0x00005c50
++			0x00005bd1 0x00005b52 0x00005ad5 0x00005a59 0x000059de 0x00005963 0x000058ea 0x00005871
++			0x000057fa 0x00005783 0x0000570d 0x00005699 0x00005625 0x000055b2 0x0000553f 0x000054ce
++			0x0000545d 0x000053ee 0x0000537f 0x00005311 0x000052a4 0x00005238 0x000051cc 0x00005161
++			0x000050f7 0x0000508e 0x00005026 0x00004fbe 0x00004f57 0x00004ef1 0x00004e8c 0x00004e27
++			0x00004dc3 0x00004d60 0x00004cfe 0x00004c9c 0x00004c3b 0x00004bdb 0x00004b7b 0x00004b1c
++			0x00004abe 0x00004a60 0x00004a03 0x000049a7 0x0000494b 0x000048f0 0x00004896 0x0000483c
++			0x000047e3 0x0000478a 0x00004733 0x000046db 0x00004685 0x0000462f 0x000045d9 0x00004584
++			0x00004530 0x000044dc 0x00004489 0x00004437 0x000043e5 0x00004393 0x00004342 0x000042f2
++			0x000042a2 0x00004253 0x00004204 0x000041b6 0x00004169 0x0000411b 0x000040cf 0x00004083
++			0x00004037 0x00003fec 0x00003fa1 0x00003f57 0x00003f0e 0x00003ec5 0x00003e7c 0x00003e34
++			0x00003dec 0x00003da5 0x00003d5e 0x00003d18 0x00003cd2 0x00003c8c 0x00003c48 0x00003c03
++			0x00003bbf 0x00003b7b 0x00003b38 0x00003af5 0x00003ab3 0x00003a71 0x00003a30 0x000039ef
++			0x000039ae 0x0000396e 0x0000392e 0x000038ee 0x000038af 0x00003871 0x00003832 0x000037f5>;
++			};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-LP097Qx1.dtsi b/include/dt-bindings/display/screen-timing/lcd-LP097Qx1.dtsi
+new file mode 100644
+index 0000000..18a4145
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-LP097Qx1.dtsi
+@@ -0,0 +1,29 @@
++/*
++ * RockChip. DisplayPort screen LP097QX1
++ *
++ */
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        timing0: timing0 {
++		screen-type = <SCREEN_EDP>;
++		out-face    = <OUT_P666>;
++		clock-frequency = <205000000>;
++		hactive = <2048>;
++		vactive = <1536>;
++		hback-porch = <5>;
++		hfront-porch = <150>;
++		vback-porch = <9>;
++		vfront-porch = <3>;
++		hsync-len = <5>;
++		vsync-len = <1>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <1>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-LP097Qx2.dtsi b/include/dt-bindings/display/screen-timing/lcd-LP097Qx2.dtsi
+new file mode 100644
+index 0000000..64f99e8
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-LP097Qx2.dtsi
+@@ -0,0 +1,106 @@
++/*
++ * Copyright (c) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This file is dual-licensed: you can use it either under the terms
++ * of the GPL or the X11 license, at your option. Note that this dual
++ * licensing only applies to this file, and not this project as a
++ * whole.
++ *
++ *  a) This file is free software; you can redistribute it and/or
++ *     modify it under the terms of the GNU General Public License as
++ *     published by the Free Software Foundation; either version 2 of the
++ *     License, or (at your option) any later version.
++ *
++ *     This file is distributed in the hope that it will be useful,
++ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *     GNU General Public License for more details.
++ *
++ * Or, alternatively,
++ *
++ *  b) Permission is hereby granted, free of charge, to any person
++ *     obtaining a copy of this software and associated documentation
++ *     files (the "Software"), to deal in the Software without
++ *     restriction, including without limitation the rights to use,
++ *     copy, modify, merge, publish, distribute, sublicense, and/or
++ *     sell copies of the Software, and to permit persons to whom the
++ *     Software is furnished to do so, subject to the following
++ *     conditions:
++ *
++ *     The above copyright notice and this permission notice shall be
++ *     included in all copies or substantial portions of the Software.
++ *
++ *     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ *     EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
++ *     OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ *     NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++ *     HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ *     WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ *     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ *     OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * include/dt-bindings/display/screen-timing/lcd-LP097QX2.dtsi
++ * author: xbl@rock-chips.com
++ * create date: 2016-05-16
++ * screen type: edp
++ * lcd model: lp097qx2
++ * resolution: 1536 * 2048
++ */
++
++disp_timings: display-timings {
++	native-mode = <&timing0>;
++	timing0: timing0 {
++		screen-type = <SCREEN_EDP>;
++		out-face    = <OUT_P888>;
++		clock-frequency = <200000000>;
++		hactive = <1536>;
++		vactive = <2048>;
++		hback-porch = <52>;
++		hfront-porch = <16>;
++		vback-porch = <3>;
++		vfront-porch = <7>;
++		hsync-len = <15>;
++		vsync-len = <1>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <1>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++		cabc-lut = <
++			/*gamma = 2.2*/
++			0x00000383 0x00000392 0x000003a2 0x000003b2 0x000003c2 0x000003d2 0x000003e2 0x000003f3
++			0x00000403 0x00000414 0x00000425 0x00000436 0x00000447 0x00000458 0x0000046a 0x0000047b
++			0x0000048d 0x0000049f 0x000004b1 0x000004c3 0x000004d5 0x000004e8 0x000004fa 0x0000050d
++			0x00000520 0x00000533 0x00000546 0x0000055a 0x0000056d 0x00000581 0x00000595 0x000005a9
++			0x000005bd 0x000005d1 0x000005e5 0x000005fa 0x0000060f 0x00000624 0x00000639 0x0000064e
++			0x00000663 0x00000679 0x0000068e 0x000006a4 0x000006ba 0x000006d0 0x000006e6 0x000006fd
++			0x00000713 0x0000072a 0x00000741 0x00000758 0x0000076f 0x00000786 0x0000079e 0x000007b6
++			0x000007cd 0x000007e5 0x000007fd 0x00000816 0x0000082e 0x00000847 0x0000085f 0x00000878
++			0x00000891 0x000008ab 0x000008c4 0x000008de 0x000008f7 0x00000911 0x0000092b 0x00000945
++			0x00000960 0x0000097a 0x00000995 0x000009af 0x000009ca 0x000009e6 0x00000a01 0x00000a1c
++			0x00000a38 0x00000a54 0x00000a6f 0x00000a8c 0x00000aa8 0x00000ac4 0x00000ae1 0x00000afd
++			0x00000b1a 0x00000b37 0x00000b54 0x00000b72 0x00000b8f 0x00000bad 0x00000bcb 0x00000be9
++			0x00000c07 0x00000c25 0x00000c44 0x00000c62 0x00000c81 0x00000ca0 0x00000cbf 0x00000cdf
++			0x00000cfe 0x00000d1e 0x00000d3e 0x00000d5d 0x00000d7e 0x00000d9e 0x00000dbe 0x00000ddf
++			0x00000e00 0x00000e21 0x00000e42 0x00000e63 0x00000e84 0x00000ea6 0x00000ec8 0x00000eea
++			0x00000f0c 0x00000f2e 0x00000f50 0x00000f73 0x00000f96 0x00000fb9 0x00000fdc 0x00000fff
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-b080xan03.0-mipi.dtsi b/include/dt-bindings/display/screen-timing/lcd-b080xan03.0-mipi.dtsi
+new file mode 100644
+index 0000000..2d3010a
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-b080xan03.0-mipi.dtsi
+@@ -0,0 +1,82 @@
++/*
++ * Copyright (C) 2014 ROCKCHIP, Inc.
++ * Licensed under GPLv2 or later.
++ * arch/arm/boot/dts/lcd-b080xan03.0-mipi.dtsi
++ * author: chenyf@rock-chips.com
++ * create date: 2014-09-11
++ * lcd model: b080xan03.0
++ * resolution: 768 X 1024
++ * mipi channel: single
++ */
++
++/* about mipi */
++disp_mipi_init: mipi_dsi_init{
++			compatible = "rockchip,mipi_dsi_init";
++			rockchip,screen_init	= <0>;
++			rockchip,dsi_lane		= <4>;
++			rockchip,dsi_hs_clk		= <528>;
++			rockchip,mipi_dsi_num	= <1>;
++};
++disp_mipi_power_ctr: mipi_power_ctr {
++			compatible = "rockchip,mipi_power_ctr";
++			mipi_lcd_rst:mipi_lcd_rst{
++					compatible = "rockchip,lcd_rst";
++					rockchip,gpios = <&gpio2 GPIO_C2 GPIO_ACTIVE_HIGH>;
++					rockchip,delay = <20>;
++			};
++		/*	mipi_lcd_en:mipi_lcd_en {
++					compatible = "rockchip,lcd_en";
++					rockchip,gpios = <&gpio0 GPIO_C1 GPIO_ACTIVE_HIGH>;
++					rockchip,delay = <100>;
++			};*/
++};
++disp_mipi_init_cmds: screen-on-cmds {
++			compatible = "rockchip,screen-on-cmds";
++			/*rockchip,cmd_debug = <1>;
++			rockchip,on-cmds1 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <HSDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0xb0 0x02>;
++					rockchip,cmd_delay = <0>;
++			};
++			*/
++};
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        compatible = "rockchip,display-timings";
++        timing0: timing0 {
++		screen-type = <SCREEN_MIPI>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_P666>;
++		clock-frequency = <67000000>;
++		hactive = <768>;
++		vactive = <1024>;
++		hback-porch = <56>;
++		hfront-porch = <60>;
++		vback-porch = <30>;
++		vfront-porch = <36>;
++		hsync-len = <64>;
++		vsync-len = <14>;
++
++		/*
++		hactive = <1024>;
++		vactive = <768>;
++		hback-porch = <56>;
++		hfront-porch = <60>;
++		vback-porch = <30>;
++		vfront-porch = <36>;
++		hsync-len = <64>;
++		vsync-len = <14>;
++		*/
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-b101ew05.dtsi b/include/dt-bindings/display/screen-timing/lcd-b101ew05.dtsi
+new file mode 100644
+index 0000000..130f504
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-b101ew05.dtsi
+@@ -0,0 +1,65 @@
++/*
++ * RockChip. LCD_B101ew05
++ *
++ */
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        timing0: timing0 {
++		screen-type = <SCREEN_LVDS>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_D888_P666>;
++		color-mode = <COLOR_RGB>;
++		clock-frequency = <71000000>;
++		hactive = <1280>;
++		vactive = <800>;
++		hback-porch = <100>;
++		hfront-porch = <18>;
++		vback-porch = <8>;
++		vfront-porch = <6>;
++		hsync-len = <10>;
++		vsync-len = <2>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++		cabc-lut = <
++			/*gamma = 2.0*/
++			 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			 0x00000001 0x00000001 0x00000001 0x00000001 0x00000001 0x00000001 0x00000001 0x00000002
++			 0x00000002 0x00000002 0x00000002 0x00000002 0x00000003 0x00000003 0x00000003 0x00000003
++			 0x00000004 0x00000004 0x00000004 0x00000004 0x00000005 0x00000005 0x00000005 0x00000005
++			 0x00000006 0x00000006 0x00000006 0x00000007 0x00000007 0x00000007 0x00000008 0x00000008
++			 0x00000009 0x00000009 0x00000009 0x0000000a 0x0000000a 0x0000000b 0x0000000b 0x0000000b
++			 0x0000000c 0x0000000c 0x0000000d 0x0000000d 0x0000000e 0x0000000e 0x0000000f 0x0000000f
++			 0x00000010 0x00000010 0x00000011 0x00000011 0x00000012 0x00000012 0x00000013 0x00000013
++			 0x00000014 0x00000014 0x00000015 0x00000016 0x00000016 0x00000017 0x00000017 0x00000018
++			 0x00000019 0x00000019 0x0000001a 0x0000001b 0x0000001b 0x0000001c 0x0000001d 0x0000001d
++			 0x0000001e 0x0000001f 0x0000001f 0x00000020 0x00000021 0x00000021 0x00000022 0x00000023
++			 0x00000024 0x00000024 0x00000025 0x00000026 0x00000027 0x00000028 0x00000028 0x00000029
++			 0x0000002a 0x0000002b 0x0000002c 0x0000002c 0x0000002d 0x0000002e 0x0000002f 0x00000030
++			 0x00000031 0x00000032 0x00000032 0x00000033 0x00000034 0x00000035 0x00000036 0x00000037
++			 0x00000038 0x00000039 0x0000003a 0x0000003b 0x0000003c 0x0000003d 0x0000003e 0x0000003f
++			 0x00000040 0x00000041 0x00000042 0x00000043 0x00000044 0x00000045 0x00000046 0x00000047
++			 0x00000048 0x00000049 0x0000004a 0x0000004b 0x0000004c 0x0000004d 0x0000004f 0x00000050
++			 0x00000051 0x00000052 0x00000053 0x00000054 0x00000055 0x00000057 0x00000058 0x00000059
++			 0x0000005a 0x0000005b 0x0000005d 0x0000005e 0x0000005f 0x00000060 0x00000061 0x00000063
++			 0x00000064 0x00000065 0x00000066 0x00000068 0x00000069 0x0000006a 0x0000006c 0x0000006d
++			 0x0000006e 0x00000070 0x00000071 0x00000072 0x00000074 0x00000075 0x00000076 0x00000078
++			 0x00000079 0x0000007a 0x0000007c 0x0000007d 0x0000007f 0x00000080 0x00000081 0x00000083
++			 0x00000084 0x00000086 0x00000087 0x00000089 0x0000008a 0x0000008c 0x0000008d 0x0000008f
++			 0x00000090 0x00000092 0x00000093 0x00000095 0x00000096 0x00000098 0x00000099 0x0000009b
++			 0x0000009c 0x0000009e 0x000000a0 0x000000a1 0x000000a3 0x000000a4 0x000000a6 0x000000a8
++			 0x000000a9 0x000000ab 0x000000ac 0x000000ae 0x000000b0 0x000000b1 0x000000b3 0x000000b5
++			 0x000000b6 0x000000b8 0x000000ba 0x000000bc 0x000000bd 0x000000bf 0x000000c1 0x000000c3
++			 0x000000c4 0x000000c6 0x000000c8 0x000000ca 0x000000cb 0x000000cd 0x000000cf 0x000000d1
++			 0x000000d3 0x000000d4 0x000000d6 0x000000d8 0x000000da 0x000000dc 0x000000de 0x000000e0
++			 0x000000e1 0x000000e3 0x000000e5 0x000000e7 0x000000e9 0x000000eb 0x000000ed 0x000000ef
++			 0x000000f1 0x000000f3 0x000000f5 0x000000f7 0x000000f9 0x000000fb 0x000000fd 0x000000ff>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-box.dtsi b/include/dt-bindings/display/screen-timing/lcd-box.dtsi
+new file mode 100644
+index 0000000..2109a89
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-box.dtsi
+@@ -0,0 +1,98 @@
++/*
++ * RockChip. LCD_BOX
++ *
++ */
++
++	disp_power_ctr: power_ctr {
++     /*                        rockchip,debug = <0>;
++        lcd_en:lcd_en {
++                rockchip,power_type = <GPIO>;
++                gpios = <&gpio0 GPIO_B0 GPIO_ACTIVE_HIGH>;
++                rockchip,delay = <10>;
++        };
++
++        bl_en:bl_en {
++                rockchip,power_type = <GPIO>;
++                gpios = <&gpio0 GPIO_A2 GPIO_ACTIVE_HIGH>;
++                rockchip,delay = <10>;
++        };
++
++        bl_ctr:bl_ctr {
++                rockchip,power_type = <GPIO>;
++                gpios = <&gpio3 GPIO_D6 GPIO_ACTIVE_HIGH>;
++                rockchip,delay = <10>;
++        };
++
++        lcd_rst:lcd_rst {
++                rockchip,power_type = <REGULATOR>;
++                rockchip,delay = <5>;
++        };*/
++
++};
++
++disp_timings: display-timings {
++	native-mode = <&timing0>;
++	timing0: timing0 {
++		screen-type = <SCREEN_RGB>;
++		out-face    = <OUT_P888>;
++		color-mode = <COLOR_YCBCR>;
++		clock-frequency = <74250000>;
++		hactive = <1280>;
++		vactive = <720>;
++		hback-porch = <220>;
++		hfront-porch = <110>;
++		vback-porch = <20>;
++		vfront-porch = <5>;
++		hsync-len = <40>;
++		vsync-len = <5>;
++		hsync-active = <1>;
++		vsync-active = <1>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++	timing1: timing1 {
++		screen-type = <SCREEN_RGB>;
++		out-face    = <OUT_P888>;
++		color-mode = <COLOR_YCBCR>;
++		clock-frequency = <148500000>;
++		hactive = <1920>;
++		vactive = <1080>;
++		hback-porch = <148>;
++		hfront-porch = <88>;
++		vback-porch = <36>;
++		vfront-porch = <4>;
++		hsync-len = <44>;
++		vsync-len = <5>;
++		hsync-active = <1>;
++		vsync-active = <1>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++	timing2: timing2 {
++		screen-type = <SCREEN_RGB>;
++		out-face    = <OUT_P888>;
++		color-mode = <COLOR_YCBCR>;
++		clock-frequency = <297000000>;
++		hactive = <3840>;
++		vactive = <2160>;
++		hback-porch = <296>;
++		hfront-porch = <176>;
++		vback-porch = <72>;
++		vfront-porch = <8>;
++		hsync-len = <88>;
++		vsync-len = <10>;
++		hsync-active = <1>;
++		vsync-active = <1>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-fpga-800x480-rgb.dtsi b/include/dt-bindings/display/screen-timing/lcd-fpga-800x480-rgb.dtsi
+new file mode 100644
+index 0000000..798262d
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-fpga-800x480-rgb.dtsi
+@@ -0,0 +1,101 @@
++/*
++ * Copyright (c) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This file is dual-licensed: you can use it either under the terms
++ * of the GPL or the X11 license, at your option. Note that this dual
++ * licensing only applies to this file, and not this project as a
++ * whole.
++ *
++ *  a) This library is free software; you can redistribute it and/or
++ *     modify it under the terms of the GNU General Public License as
++ *     published by the Free Software Foundation; either version 2 of the
++ *     License, or (at your option) any later version.
++ *
++ *     This library is distributed in the hope that it will be useful,
++ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *     GNU General Public License for more details.
++ *
++ * Or, alternatively,
++ *
++ *  b) Permission is hereby granted, free of charge, to any person
++ *     obtaining a copy of this software and associated documentation
++ *     files (the "Software"), to deal in the Software without
++ *     restriction, including without limitation the rights to use,
++ *     copy, modify, merge, publish, distribute, sublicense, and/or
++ *     sell copies of the Software, and to permit persons to whom the
++ *     Software is furnished to do so, subject to the following
++ *     conditions:
++ *
++ *     The above copyright notice and this permission notice shall be
++ *     included in all copies or substantial portions of the Software.
++ *
++ *     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ *     EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
++ *     OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ *     NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++ *     HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ *     WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ *     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ *     OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++disp_timings: display-timings {
++	native-mode = <&timing0>;
++	timing0: timing0 {
++		screen-type = <SCREEN_RGB>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_D888_P666>;
++		color-mode = <COLOR_RGB>;
++		clock-frequency = <71000000>;
++		hactive = <800>;
++		vactive = <480>;
++		hback-porch = <206>;
++		hfront-porch = <1>;
++		vback-porch = <25>;
++		vfront-porch = <10>;
++		hsync-len = <10>;
++		vsync-len = <10>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++		cabc-lut = <
++			/*gamma = 2.0*/
++			 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			 0x00000001 0x00000001 0x00000001 0x00000001 0x00000001 0x00000001 0x00000001 0x00000002
++			 0x00000002 0x00000002 0x00000002 0x00000002 0x00000003 0x00000003 0x00000003 0x00000003
++			 0x00000004 0x00000004 0x00000004 0x00000004 0x00000005 0x00000005 0x00000005 0x00000005
++			 0x00000006 0x00000006 0x00000006 0x00000007 0x00000007 0x00000007 0x00000008 0x00000008
++			 0x00000009 0x00000009 0x00000009 0x0000000a 0x0000000a 0x0000000b 0x0000000b 0x0000000b
++			 0x0000000c 0x0000000c 0x0000000d 0x0000000d 0x0000000e 0x0000000e 0x0000000f 0x0000000f
++			 0x00000010 0x00000010 0x00000011 0x00000011 0x00000012 0x00000012 0x00000013 0x00000013
++			 0x00000014 0x00000014 0x00000015 0x00000016 0x00000016 0x00000017 0x00000017 0x00000018
++			 0x00000019 0x00000019 0x0000001a 0x0000001b 0x0000001b 0x0000001c 0x0000001d 0x0000001d
++			 0x0000001e 0x0000001f 0x0000001f 0x00000020 0x00000021 0x00000021 0x00000022 0x00000023
++			 0x00000024 0x00000024 0x00000025 0x00000026 0x00000027 0x00000028 0x00000028 0x00000029
++			 0x0000002a 0x0000002b 0x0000002c 0x0000002c 0x0000002d 0x0000002e 0x0000002f 0x00000030
++			 0x00000031 0x00000032 0x00000032 0x00000033 0x00000034 0x00000035 0x00000036 0x00000037
++			 0x00000038 0x00000039 0x0000003a 0x0000003b 0x0000003c 0x0000003d 0x0000003e 0x0000003f
++			 0x00000040 0x00000041 0x00000042 0x00000043 0x00000044 0x00000045 0x00000046 0x00000047
++			 0x00000048 0x00000049 0x0000004a 0x0000004b 0x0000004c 0x0000004d 0x0000004f 0x00000050
++			 0x00000051 0x00000052 0x00000053 0x00000054 0x00000055 0x00000057 0x00000058 0x00000059
++			 0x0000005a 0x0000005b 0x0000005d 0x0000005e 0x0000005f 0x00000060 0x00000061 0x00000063
++			 0x00000064 0x00000065 0x00000066 0x00000068 0x00000069 0x0000006a 0x0000006c 0x0000006d
++			 0x0000006e 0x00000070 0x00000071 0x00000072 0x00000074 0x00000075 0x00000076 0x00000078
++			 0x00000079 0x0000007a 0x0000007c 0x0000007d 0x0000007f 0x00000080 0x00000081 0x00000083
++			 0x00000084 0x00000086 0x00000087 0x00000089 0x0000008a 0x0000008c 0x0000008d 0x0000008f
++			 0x00000090 0x00000092 0x00000093 0x00000095 0x00000096 0x00000098 0x00000099 0x0000009b
++			 0x0000009c 0x0000009e 0x000000a0 0x000000a1 0x000000a3 0x000000a4 0x000000a6 0x000000a8
++			 0x000000a9 0x000000ab 0x000000ac 0x000000ae 0x000000b0 0x000000b1 0x000000b3 0x000000b5
++			 0x000000b6 0x000000b8 0x000000ba 0x000000bc 0x000000bd 0x000000bf 0x000000c1 0x000000c3
++			 0x000000c4 0x000000c6 0x000000c8 0x000000ca 0x000000cb 0x000000cd 0x000000cf 0x000000d1
++			 0x000000d3 0x000000d4 0x000000d6 0x000000d8 0x000000da 0x000000dc 0x000000de 0x000000e0
++			 0x000000e1 0x000000e3 0x000000e5 0x000000e7 0x000000e9 0x000000eb 0x000000ed 0x000000ef
++			 0x000000f1 0x000000f3 0x000000f5 0x000000f7 0x000000f9 0x000000fb 0x000000fd 0x000000ff>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-h381dln01-1080x1200-double.dtsi b/include/dt-bindings/display/screen-timing/lcd-h381dln01-1080x1200-double.dtsi
+new file mode 100644
+index 0000000..1fb6e2d
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-h381dln01-1080x1200-double.dtsi
+@@ -0,0 +1,315 @@
++/*
++ *
++ * Copyright (c) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This file is dual-licensed: you can use it either under the terms
++ * of the GPL or the X11 license, at your option. Note that this dual
++ * licensing only applies to this file, and not this project as a
++ * whole.
++ *
++ *  a) This file is free software; you can redistribute it and/or
++ *     modify it under the terms of the GNU General Public License as
++ *     published by the Free Software Foundation; either version 2 of the
++ *     License, or (at your option) any later version.
++ *
++ *     This file is distributed in the hope that it will be useful,
++ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *     GNU General Public License for more details.
++ *
++ * Or, alternatively,
++ *
++ *  b) Permission is hereby granted, free of charge, to any person
++ *     obtaining a copy of this software and associated documentation
++ *     files (the "Software"), to deal in the Software without
++ *     restriction, including without limitation the rights to use,
++ *     copy, modify, merge, publish, distribute, sublicense, and/or
++ *     sell copies of the Software, and to permit persons to whom the
++ *     Software is furnished to do so, subject to the following
++ *     conditions:
++ *
++ *     The above copyright notice and this permission notice shall be
++ *     included in all copies or substantial portions of the Software.
++ *
++ *     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ *     EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
++ *     OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ *     NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++ *     HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ *     WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ *     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ *     OTHER DEALINGS IN THE SOFTWARE.
++ * author: xubilv <xbl@rock-chips.com>
++ * create date: 2016-08-11
++ * resolution: 1080 X 1200
++ * mipi channel: double
++ */
++
++/* about mipi */
++disp_mipi_init: mipi_dsi_init {
++	compatible = "rockchip,mipi_dsi_init";
++	rockchip,screen_init	= <1>;
++	rockchip,dsi_lane	= <4>;
++	rockchip,dsi_hs_clk	= <970>;
++	rockchip,mipi_dsi_num	= <2>;
++};
++
++disp_mipi_power_ctr: mipi_power_ctr {
++	compatible = "rockchip,mipi_power_ctr";
++
++	/*mipi_lcd_rst:mipi_lcd_rst {
++			compatible = "rockchip,lcd_rst";
++			rockchip,gpios = <&gpio7 GPIO_A1 GPIO_ACTIVE_LOW>;
++			rockchip,delay = <0>;
++	};
++
++	mipi_lcd_avdd:mipi_lcd_avdd {
++			compatible = "rockchip,lcd_avdd";
++			rockchip,gpios = <&gpio7 GPIO_A2 GPIO_ACTIVE_HIGH>;
++			rockchip,delay = <0>;
++	};
++
++	mipi_lcd_ovdd:mipi_lcd_ovdd {
++			compatible = "rockchip,lcd_ovdd";
++			rockchip,gpios = <&gpio7 GPIO_A3 GPIO_ACTIVE_HIGH>;
++			rockchip,delay = <0>;
++	};
++
++	mipi_lcd_ovss:mipi_lcd_ovss {
++		compatible = "rockchip,lcd_ovss";
++		rockchip,gpios = <&gpio7 GPIO_B0 GPIO_ACTIVE_HIGH>;
++		rockchip,delay = <0>;
++	};
++	mipi_lcd_rst:mipi_lcd_rst{
++			compatible = "rockchip,lcd_rst";
++			rockchip,gpios = <&gpio7 GPIO_A1 GPIO_ACTIVE_LOW>;
++			rockchip,delay = <100>;
++	};
++	mipi_lcd_en:mipi_lcd_en {
++			compatible = "rockchip,lcd_en";
++			rockchip,gpios = <&gpio0 GPIO_C1 GPIO_ACTIVE_HIGH>;
++			rockchip,delay = <100>;
++	};*/
++};
++
++disp_mipi_init_cmds: screen-on-cmds {
++	compatible = "rockchip,screen-on-cmds";
++	rockchip,cmd_debug = <0>;
++	rockchip,on-cmds1 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xFE 0x07>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds2 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x00 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds3 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x0B 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds4 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x16 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds5 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x21 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds6 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x2D 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds7 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xA9 0xBA>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds8 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xAB 0x06>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds9 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xBB 0x84>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds10 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xBC 0x1C>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds11 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xFE 0x08>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds12 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x07 0x1A>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds13 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xFE 0x0A>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds14 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x2A 0x1B>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds15 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xFE 0x0D>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds16 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x02 0x65>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds17 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x4D 0x41>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds18 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x4B 0x0F>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds19 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x53 0xFE>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds20 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xFE 0x00>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds21 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0xC2 0x03>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds22 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x15 0x51 0xFF>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds23 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x05 0x11>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds24 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <2>;
++		rockchip,cmd = <0x05 0x29>;
++		rockchip,cmd_delay = <10>;
++	};
++};
++
++disp_timings: display-timings {
++	native-mode = <&timing0>;
++	compatible = "rockchip,display-timings";
++	timing0: timing0 {
++		 screen-type = <SCREEN_DUAL_MIPI>;
++		 lvds-format = <LVDS_8BIT_2>;
++		 out-face    = <OUT_P888>;
++		 clock-frequency = <278154000>;
++		 hactive = <2160>; //1080
++		 vactive = <1200>;
++		 hback-porch = <180>;
++		 hfront-porch = <200>;
++		 vback-porch = <3>;
++		 vfront-porch = <6>;
++		 hsync-len = <10>;
++		 vsync-len = <3>;
++		 hsync-active = <0>;
++		 vsync-active = <0>;
++		 de-active = <0>;
++		 pixelclk-active = <0>;
++		 swap-rb = <0>;
++		 swap-rg = <0>;
++		 swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-h381dln01-1080x1200.dtsi b/include/dt-bindings/display/screen-timing/lcd-h381dln01-1080x1200.dtsi
+new file mode 100644
+index 0000000..9948094
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-h381dln01-1080x1200.dtsi
+@@ -0,0 +1,314 @@
++/*
++ * Copyright (c) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This file is dual-licensed: you can use it either under the terms
++ * of the GPL or the X11 license, at your option. Note that this dual
++ * licensing only applies to this file, and not this project as a
++ * whole.
++ *
++ *  a) This file is free software; you can redistribute it and/or
++ *     modify it under the terms of the GNU General Public License as
++ *     published by the Free Software Foundation; either version 2 of the
++ *     License, or (at your option) any later version.
++ *
++ *     This file is distributed in the hope that it will be useful,
++ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *     GNU General Public License for more details.
++ *
++ * Or, alternatively,
++ *
++ *  b) Permission is hereby granted, free of charge, to any person
++ *     obtaining a copy of this software and associated documentation
++ *     files (the "Software"), to deal in the Software without
++ *     restriction, including without limitation the rights to use,
++ *     copy, modify, merge, publish, distribute, sublicense, and/or
++ *     sell copies of the Software, and to permit persons to whom the
++ *     Software is furnished to do so, subject to the following
++ *     conditions:
++ *
++ *     The above copyright notice and this permission notice shall be
++ *     included in all copies or substantial portions of the Software.
++ *
++ *     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ *     EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
++ *     OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ *     NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++ *     HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ *     WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ *     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ *     OTHER DEALINGS IN THE SOFTWARE.
++ * author: xubilv <xbl@rock-chips.com>
++ * create date: 2016-08-11
++ * resolution: 1080 X 1200
++ * mipi channel: single
++ */
++
++disp_mipi_init: mipi_dsi_init {
++	compatible = "rockchip,mipi_dsi_init";
++	rockchip,screen_init	= <1>;
++	rockchip,dsi_lane	= <4>;
++	rockchip,dsi_hs_clk	= <970>;
++	rockchip,mipi_dsi_num	= <1>;
++};
++
++disp_mipi_power_ctr: mipi_power_ctr {
++	compatible = "rockchip,mipi_power_ctr";
++
++	/*mipi_lcd_rst:mipi_lcd_rst {
++		compatible = "rockchip,lcd_rst";
++		rockchip,gpios = <&gpio7 GPIO_A1 GPIO_ACTIVE_LOW>;
++		rockchip,delay = <0>;
++	};
++
++	mipi_lcd_avdd:mipi_lcd_avdd {
++		compatible = "rockchip,lcd_avdd";
++		rockchip,gpios = <&gpio7 GPIO_A2 GPIO_ACTIVE_HIGH>;
++		rockchip,delay = <0>;
++	};
++
++	mipi_lcd_ovdd:mipi_lcd_ovdd {
++		compatible = "rockchip,lcd_ovdd";
++		rockchip,gpios = <&gpio7 GPIO_A3 GPIO_ACTIVE_HIGH>;
++		rockchip,delay = <0>;
++	};
++
++	mipi_lcd_ovss:mipi_lcd_ovss {
++		compatible = "rockchip,lcd_ovss";
++		rockchip,gpios = <&gpio7 GPIO_B0 GPIO_ACTIVE_HIGH>;
++		rockchip,delay = <0>;
++	};
++
++	mipi_lcd_rst:mipi_lcd_rst {
++		compatible = "rockchip,lcd_rst";
++		rockchip,gpios = <&gpio7 GPIO_A1 GPIO_ACTIVE_LOW>;
++		rockchip,delay = <100>;
++	};
++
++	mipi_lcd_en:mipi_lcd_en {
++		compatible = "rockchip,lcd_en";
++		rockchip,gpios = <&gpio0 GPIO_C1 GPIO_ACTIVE_HIGH>;
++		rockchip,delay = <100>;
++	};*/
++};
++
++disp_mipi_init_cmds: screen-on-cmds {
++	compatible = "rockchip,screen-on-cmds";
++	rockchip,cmd_debug = <0>;
++	rockchip,on-cmds1 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xFE 0x07>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds2 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x00 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds3 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x0B 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds4 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x16 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds5 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x21 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds6 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x2D 0xEC>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds7 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xA9 0xBA>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds8 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xAB 0x06>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds9 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xBB 0x84>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds10 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xBC 0x1C>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds11 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xFE 0x08>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds12 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x07 0x1A>;
++		rockchip,cmd_delay = <0>;
++	};
++	rockchip,on-cmds13 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xFE 0x0A>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds14 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x2A 0x1B>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds15 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xFE 0x0D>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds16 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x02 0x65>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds17 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x4D 0x41>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds18 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x4B 0x0F>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds19 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x53 0xFE>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds20 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xFE 0x00>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds21 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0xC2 0x03>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds22 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x15 0x51 0xFF>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds23 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x05 0x11>;
++		rockchip,cmd_delay = <0>;
++	};
++
++	rockchip,on-cmds24 {
++		compatible = "rockchip,on-cmds";
++		rockchip,cmd_type = <LPDT>;
++		rockchip,dsi_id = <0>;
++		rockchip,cmd = <0x05 0x29>;
++		rockchip,cmd_delay = <10>;
++	};
++};
++
++disp_timings: display-timings {
++	native-mode = <&timing0>;
++	compatible = "rockchip,display-timings";
++	timing0: timing0 {
++		screen-type = <SCREEN_MIPI>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_P888>;
++		clock-frequency = <139000000>;//139
++		hactive = <1080>;
++		vactive = <1200>;
++		hback-porch = <90>;
++		hfront-porch = <100>;
++		vback-porch = <3>;
++		vfront-porch = <6>;
++		hsync-len = <5>;
++		vsync-len = <3>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-ld089wu1-mipi.dtsi b/include/dt-bindings/display/screen-timing/lcd-ld089wu1-mipi.dtsi
+new file mode 100644
+index 0000000..6643da5
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-ld089wu1-mipi.dtsi
+@@ -0,0 +1,138 @@
++/*
++ * Copyright (C) 2014 ROCKCHIP, Inc.
++ * arch/arm/boot/dts/lcd-lq070m1sx01-mipi.dtsi
++ * author: libing@rock-chips.com
++ * create date: 2014-04-15
++ * lcd model: ld089wu1
++ * resolution: 1920 X 1200
++ * mipi channel: single
++ */
++
++/* about mipi */
++disp_mipi_init: mipi_dsi_init{
++			compatible = "rockchip,mipi_dsi_init";
++			rockchip,screen_init	= <0>;
++			rockchip,dsi_lane		= <4>;
++			rockchip,dsi_hs_clk		= <1000>;
++			rockchip,mipi_dsi_num	= <1>;
++};
++disp_mipi_power_ctr: mipi_power_ctr {
++			compatible = "rockchip,mipi_power_ctr";
++			/*mipi_lcd_rst:mipi_lcd_rst{
++					compatible = "rockchip,lcd_rst";
++					rockchip,gpios = <&gpio2 GPIO_B7 GPIO_ACTIVE_LOW>;
++					rockchip,delay = <100>;
++			};
++			mipi_lcd_en:mipi_lcd_en {
++					compatible = "rockchip,lcd_en";
++					rockchip,gpios = <&gpio0 GPIO_C1 GPIO_ACTIVE_HIGH>;
++					rockchip,delay = <100>;
++			};*/
++};
++disp_mipi_init_cmds: screen-on-cmds {
++			compatible = "rockchip,screen-on-cmds";
++			/*rockchip,cmd_debug = <1>;
++			rockchip,on-cmds1 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <HSDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0xb0 0x02>;
++					rockchip,cmd_delay = <0>;
++			};
++			*/
++};
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        compatible = "rockchip,display-timings";
++        timing0: timing0 {
++		screen-type = <SCREEN_MIPI>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_P888>;
++		clock-frequency = <145000000>;
++		hactive = <1920>;
++		vactive = <1200>;
++		hback-porch = <16>;
++		hfront-porch = <24>;
++		vback-porch = <10>;
++		vfront-porch = <16>;
++		hsync-len = <10>;
++		vsync-len = <3>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++		cabc-lut = <
++			/*gamma = 2.2*/
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000001
++			0x00000001 0x00000001 0x00000001 0x00000001 0x00000001 0x00000001 0x00000001 0x00000001
++			0x00000001 0x00000002 0x00000002 0x00000002 0x00000002 0x00000002 0x00000002 0x00000002
++			0x00000003 0x00000003 0x00000003 0x00000003 0x00000003 0x00000004 0x00000004 0x00000004
++			0x00000004 0x00000005 0x00000005 0x00000005 0x00000005 0x00000006 0x00000006 0x00000006
++			0x00000006 0x00000007 0x00000007 0x00000007 0x00000008 0x00000008 0x00000008 0x00000009
++			0x00000009 0x00000009 0x0000000a 0x0000000a 0x0000000b 0x0000000b 0x0000000b 0x0000000c
++			0x0000000c 0x0000000d 0x0000000d 0x0000000d 0x0000000e 0x0000000e 0x0000000f 0x0000000f
++			0x00000010 0x00000010 0x00000011 0x00000011 0x00000012 0x00000012 0x00000013 0x00000013
++			0x00000014 0x00000014 0x00000015 0x00000016 0x00000016 0x00000017 0x00000017 0x00000018
++			0x00000019 0x00000019 0x0000001a 0x0000001a 0x0000001b 0x0000001c 0x0000001c 0x0000001d
++			0x0000001e 0x0000001e 0x0000001f 0x00000020 0x00000021 0x00000021 0x00000022 0x00000023
++			0x00000023 0x00000024 0x00000025 0x00000026 0x00000027 0x00000027 0x00000028 0x00000029
++			0x0000002a 0x0000002b 0x0000002b 0x0000002c 0x0000002d 0x0000002e 0x0000002f 0x00000030
++			0x00000031 0x00000031 0x00000032 0x00000033 0x00000034 0x00000035 0x00000036 0x00000037
++			0x00000038 0x00000039 0x0000003a 0x0000003b 0x0000003c 0x0000003d 0x0000003e 0x0000003f
++			0x00000040 0x00000041 0x00000042 0x00000043 0x00000044 0x00000045 0x00000046 0x00000047
++			0x00000049 0x0000004a 0x0000004b 0x0000004c 0x0000004d 0x0000004e 0x0000004f 0x00000051
++			0x00000052 0x00000053 0x00000054 0x00000055 0x00000057 0x00000058 0x00000059 0x0000005a
++			0x0000005b 0x0000005d 0x0000005e 0x0000005f 0x00000061 0x00000062 0x00000063 0x00000064
++			0x00000066 0x00000067 0x00000069 0x0000006a 0x0000006b 0x0000006d 0x0000006e 0x0000006f
++			0x00000071 0x00000072 0x00000074 0x00000075 0x00000077 0x00000078 0x00000079 0x0000007b
++			0x0000007c 0x0000007e 0x0000007f 0x00000081 0x00000082 0x00000084 0x00000085 0x00000087
++			0x00000089 0x0000008a 0x0000008c 0x0000008d 0x0000008f 0x00000091 0x00000092 0x00000094
++			0x00000095 0x00000097 0x00000099 0x0000009a 0x0000009c 0x0000009e 0x0000009f 0x000000a1
++			0x000000a3 0x000000a5 0x000000a6 0x000000a8 0x000000aa 0x000000ac 0x000000ad 0x000000af
++			0x000000b1 0x000000b3 0x000000b5 0x000000b6 0x000000b8 0x000000ba 0x000000bc 0x000000be
++			0x000000c0 0x000000c2 0x000000c4 0x000000c5 0x000000c7 0x000000c9 0x000000cb 0x000000cd
++			0x000000cf 0x000000d1 0x000000d3 0x000000d5 0x000000d7 0x000000d9 0x000000db 0x000000dd
++			0x000000df 0x000000e1 0x000000e3 0x000000e5 0x000000e7 0x000000ea 0x000000ec 0x000000ee
++			0x000000f0 0x000000f2 0x000000f4 0x000000f6 0x000000f8 0x000000fb 0x000000fd 0x000000ff>;
++		cabc-gamma-base = <
++			/*gamma = 2.2*/
++			0x00010000 0x0000fdd0 0x0000fba8 0x0000f986 0x0000f76a 0x0000f556 0x0000f347 0x0000f140
++			0x0000ef3e 0x0000ed43 0x0000eb4e 0x0000e95e 0x0000e775 0x0000e592 0x0000e3b4 0x0000e1dc
++			0x0000e009 0x0000de3c 0x0000dc74 0x0000dab2 0x0000d8f4 0x0000d73c 0x0000d589 0x0000d3db
++			0x0000d232 0x0000d08d 0x0000ceee 0x0000cd53 0x0000cbbc 0x0000ca2b 0x0000c89d 0x0000c714
++			0x0000c590 0x0000c410 0x0000c294 0x0000c11c 0x0000bfa8 0x0000be39 0x0000bccd 0x0000bb65
++			0x0000ba01 0x0000b8a1 0x0000b745 0x0000b5ed 0x0000b498 0x0000b347 0x0000b1f9 0x0000b0af
++			0x0000af68 0x0000ae25 0x0000ace5 0x0000aba8 0x0000aa6f 0x0000a939 0x0000a806 0x0000a6d7
++			0x0000a5aa 0x0000a480 0x0000a35a 0x0000a236 0x0000a116 0x00009ff8 0x00009edd 0x00009dc5
++			0x00009cb0 0x00009b9e 0x00009a8e 0x00009981 0x00009877 0x0000976f 0x0000966a 0x00009567
++			0x00009467 0x0000936a 0x0000926f 0x00009176 0x00009080 0x00008f8c 0x00008e9a 0x00008dab
++			0x00008cbe 0x00008bd3 0x00008aea 0x00008a04 0x00008920 0x0000883e 0x0000875e 0x00008680
++			0x000085a4 0x000084ca 0x000083f3 0x0000831d 0x00008249 0x00008177 0x000080a7 0x00007fd9
++			0x00007f0d 0x00007e42 0x00007d7a 0x00007cb3 0x00007bee 0x00007b2b 0x00007a6a 0x000079aa
++			0x000078ec 0x0000782f 0x00007775 0x000076bc 0x00007604 0x0000754f 0x0000749a 0x000073e8
++			0x00007337 0x00007287 0x000071d9 0x0000712c 0x00007081 0x00006fd8 0x00006f30 0x00006e89
++			0x00006de4 0x00006d40 0x00006c9d 0x00006bfc 0x00006b5c 0x00006abe 0x00006a21 0x00006985
++			0x000068ea 0x00006851 0x000067b9 0x00006722 0x0000668d 0x000065f9 0x00006566 0x000064d4
++			0x00006443 0x000063b4 0x00006325 0x00006298 0x0000620c 0x00006181 0x000060f8 0x0000606f
++			0x00005fe7 0x00005f61 0x00005edb 0x00005e57 0x00005dd4 0x00005d51 0x00005cd0 0x00005c50
++			0x00005bd1 0x00005b52 0x00005ad5 0x00005a59 0x000059de 0x00005963 0x000058ea 0x00005871
++			0x000057fa 0x00005783 0x0000570d 0x00005699 0x00005625 0x000055b2 0x0000553f 0x000054ce
++			0x0000545d 0x000053ee 0x0000537f 0x00005311 0x000052a4 0x00005238 0x000051cc 0x00005161
++			0x000050f7 0x0000508e 0x00005026 0x00004fbe 0x00004f57 0x00004ef1 0x00004e8c 0x00004e27
++			0x00004dc3 0x00004d60 0x00004cfe 0x00004c9c 0x00004c3b 0x00004bdb 0x00004b7b 0x00004b1c
++			0x00004abe 0x00004a60 0x00004a03 0x000049a7 0x0000494b 0x000048f0 0x00004896 0x0000483c
++			0x000047e3 0x0000478a 0x00004733 0x000046db 0x00004685 0x0000462f 0x000045d9 0x00004584
++			0x00004530 0x000044dc 0x00004489 0x00004437 0x000043e5 0x00004393 0x00004342 0x000042f2
++			0x000042a2 0x00004253 0x00004204 0x000041b6 0x00004169 0x0000411b 0x000040cf 0x00004083
++			0x00004037 0x00003fec 0x00003fa1 0x00003f57 0x00003f0e 0x00003ec5 0x00003e7c 0x00003e34
++			0x00003dec 0x00003da5 0x00003d5e 0x00003d18 0x00003cd2 0x00003c8c 0x00003c48 0x00003c03
++			0x00003bbf 0x00003b7b 0x00003b38 0x00003af5 0x00003ab3 0x00003a71 0x00003a30 0x000039ef
++			0x000039ae 0x0000396e 0x0000392e 0x000038ee 0x000038af 0x00003871 0x00003832 0x000037f5>;
++			};
++	};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-lq070m1sx01-mipi.dtsi b/include/dt-bindings/display/screen-timing/lcd-lq070m1sx01-mipi.dtsi
+new file mode 100644
+index 0000000..2d21964
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-lq070m1sx01-mipi.dtsi
+@@ -0,0 +1,128 @@
++/*
++ * Copyright (C) 2014 ROCKCHIP, Inc.
++ * arch/arm/boot/dts/lcd-lq070m1sx01-mipi.dtsi
++ * author: libing@rock-chips.com
++ * create date: 2014-04-15
++ * lcd model: lq070m1sx01
++ * resolution: 1920 X 1200
++ * mipi channel: dual
++ */
++
++/* about mipi */
++disp_mipi_init: mipi_dsi_init{
++			compatible = "rockchip,mipi_dsi_init";
++			rockchip,screen_init	= <1>;
++			rockchip,dsi_lane		= <2>;
++			rockchip,dsi_hs_clk		= <1000>;
++			rockchip,mipi_dsi_num	= <2>;
++};
++disp_mipi_power_ctr: mipi_power_ctr {
++			compatible = "rockchip,mipi_power_ctr";
++			mipi_lcd_rst:mipi_lcd_rst{
++					compatible = "rockchip,lcd_rst";
++					rockchip,gpios = <&gpio2 GPIO_B7 GPIO_ACTIVE_HIGH>;
++					rockchip,delay = <10>;
++			};
++			mipi_lcd_en:mipi_lcd_en {
++					compatible = "rockchip,lcd_en";
++					rockchip,gpios = <&gpio0 GPIO_C1 GPIO_ACTIVE_HIGH>;
++					rockchip,delay = <10>;
++			};
++};
++disp_mipi_init_cmds: screen-on-cmds {
++			rockchip,cmd_debug = <0>;
++			compatible = "rockchip,screen-on-cmds";
++			rockchip,on-cmds1 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0xb0 0x02>;
++					rockchip,cmd_delay = <0>;
++			};
++
++			rockchip,on-cmds2 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0xb1 0x21>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds3 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0xb0 0x06>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds4 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0xb1 0x21>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds5 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0xb4 0x15>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds6 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0xb9 0x40>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds7 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0xb0 0x00>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds8 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x05 dcs_set_display_on>;
++					rockchip,cmd_delay = <10>;
++			};
++			rockchip,on-cmds9 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,data_type = <DATA_TYPE_DCS>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x05 dcs_exit_sleep_mode>;
++					rockchip,cmd_delay = <10>;
++			};
++};
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        compatible = "rockchip,display-timings";
++        timing0: timing0 {
++		screen-type = <SCREEN_DUAL_MIPI>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_P888>;
++		clock-frequency = <150000000>;
++		hactive = <1200>;
++		vactive = <1920>;
++		hsync-len = <8>;
++		hback-porch = <32>;
++		hfront-porch = <156>;
++
++		vsync-len = <2>;
++		vback-porch = <6>;
++		vfront-porch = <12>;
++
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-ls055r1sx04-mipi.dtsi b/include/dt-bindings/display/screen-timing/lcd-ls055r1sx04-mipi.dtsi
+new file mode 100644
+index 0000000..7e93e7e
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-ls055r1sx04-mipi.dtsi
+@@ -0,0 +1,170 @@
++/*
++ * Copyright (c) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This file is dual-licensed: you can use it either under the terms
++ * of the GPL or the X11 license, at your option. Note that this dual
++ * licensing only applies to this file, and not this project as a
++ * whole.
++ *
++ *  a) This file is free software; you can redistribute it and/or
++ *     modify it under the terms of the GNU General Public License as
++ *     published by the Free Software Foundation; either version 2 of the
++ *     License, or (at your option) any later version.
++ *
++ *     This file is distributed in the hope that it will be useful,
++ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *     GNU General Public License for more details.
++ *
++ * Or, alternatively,
++ *
++ *  b) Permission is hereby granted, free of charge, to any person
++ *     obtaining a copy of this software and associated documentation
++ *     files (the "Software"), to deal in the Software without
++ *     restriction, including without limitation the rights to use,
++ *     copy, modify, merge, publish, distribute, sublicense, and/or
++ *     sell copies of the Software, and to permit persons to whom the
++ *     Software is furnished to do so, subject to the following
++ *     conditions:
++ *
++ *     The above copyright notice and this permission notice shall be
++ *     included in all copies or substantial portions of the Software.
++ *
++ *     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ *     EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
++ *     OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ *     NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++ *     HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ *     WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ *     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ *     OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * include/dt-bindings/display/screen-timing/lcd-ls055r1sx04-mipi.dtsi
++ * author: xbl@rock-chips.com
++ * create date: 2016-05-16
++ * lcd model: sharp ls055r1sx04
++ * resolution: 1440 * 2560
++ * mipi channel: double
++ */
++
++/* about mipi */
++disp_mipi_init: mipi_dsi_init{
++	compatible = "rockchip,mipi_dsi_init";
++	rockchip,screen_init	= <1>;
++	rockchip,dsi_lane	= <4>;
++	rockchip,dsi_hs_clk	= <850>;
++	rockchip,mipi_dsi_num	= <2>;
++};
++
++disp_mipi_power_ctr: mipi_power_ctr {
++	compatible = "rockchip,mipi_power_ctr";
++	/* mipi_lcd_rst:mipi_lcd_rst{
++			compatible = "rockchip,lcd_rst";
++			rockchip,gpios = <&gpio2 GPIO_B7 GPIO_ACTIVE_LOW>;
++			rockchip,delay = <100>;
++	};
++	mipi_lcd_en:mipi_lcd_en {
++			compatible = "rockchip,lcd_en";
++			rockchip,gpios = <&gpio0 GPIO_C1 GPIO_ACTIVE_HIGH>;
++			rockchip,delay = <100>;
++	};
++	*/
++};
++
++disp_mipi_init_cmds: screen-on-cmds {
++	compatible = "rockchip,screen-on-cmds";
++	rockchip,cmd_debug = <1>;
++	rockchip,on-cmds1 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <LPDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0x29 0xb0 0x00>;
++			rockchip,cmd_delay = <0>;
++	};
++	rockchip,on-cmds2 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <LPDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0x29 0xd6 0x01>;
++			rockchip,cmd_delay = <0>;
++	};
++	rockchip,on-cmds3 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <LPDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0x29 0xb3 0x18>;
++			rockchip,cmd_delay = <0>;
++	};
++	rockchip,on-cmds4 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <LPDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0x39 0x51 0xff>;
++			rockchip,cmd_delay = <0>;
++	};
++	rockchip,on-cmds5 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <LPDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0x39 0x53 0x0c>;
++			rockchip,cmd_delay = <0>;
++	};
++	rockchip,on-cmds6 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <LPDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0x39 0x35 0x00>;
++			rockchip,cmd_delay = <0>;
++	};
++/*
++	rockchip,on-cmds7 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <LPDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0x29 0xb0 0x03>;
++			rockchip,cmd_delay = <0>;
++	};
++*/
++	rockchip,on-cmds7 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <LPDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0x05 dcs_set_display_on>;
++			rockchip,cmd_delay = <10>;
++	};
++	rockchip,on-cmds8 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <LPDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0x05 dcs_exit_sleep_mode>;
++			rockchip,cmd_delay = <10>;
++	};
++};
++
++disp_timings: display-timings {
++	native-mode = <&timing0>;
++	compatible = "rockchip,display-timings";
++	timing0: timing0 {
++		screen-type = <SCREEN_DUAL_MIPI>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_P888>;
++		clock-frequency = <245000000>;
++		hactive = <1440>;
++		vactive = <2560>;
++		hback-porch = <40>;
++		hfront-porch = <100>;
++		vback-porch = <3>;
++		vfront-porch = <4>;
++		hsync-len = <6>;
++		vsync-len = <1>;
++		screen-width = <68>;
++		screen-hight = <120>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-rk3128-86v-LVDS1024x600.dtsi b/include/dt-bindings/display/screen-timing/lcd-rk3128-86v-LVDS1024x600.dtsi
+new file mode 100644
+index 0000000..3895431
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-rk3128-86v-LVDS1024x600.dtsi
+@@ -0,0 +1,33 @@
++/*
++ * RockChip. LCD_LVDS1024x600 FOR rk3128-86V
++ *
++ */
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        timing0: timing0 {
++		screen-type = <SCREEN_LVDS>;
++		lvds-format = <LVDS_8BIT_1>;
++		out-face    = <OUT_P888>;
++		/* Min   Typ   Max Unit
++		 * Clock Frequency fclk  44.9  51.2  63 MHz
++		 */
++		clock-frequency = <60000000>;
++		hactive = <1024>;			  /* Horizontal display area thd 1024       DCLK			*/
++		vactive = <600>;			  /* Vertical display area tvd   600		H				*/
++		hback-porch = <90>;			  /* HS Width +Back Porch   160  160   160  DCLK (Thw+ thbp)*/
++		hfront-porch = <160>;		  /* HS front porch thfp    16   160   216  DCLK			*/
++		vback-porch = <13>;			  /* VS front porch tvfp	1	 12    127  H				*/
++		vfront-porch = <12>;		  /* VS Width+Back Porch    23   23    23   H (Tvw+ tvbp)	*/
++		hsync-len = <70>;			  /* HS Pulse Width thw		1	  -    140  DCLK			*/
++		vsync-len = <10>;			  /* VS Pulse Width tvw		1	  -	20  H				*/
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-td043mgeal.dtsi b/include/dt-bindings/display/screen-timing/lcd-td043mgeal.dtsi
+new file mode 100644
+index 0000000..db20efa
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-td043mgeal.dtsi
+@@ -0,0 +1,29 @@
++/*
++ * RockChip. LCD_TD043MGEA1 FOR FPGA
++ *
++ */
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        timing0: timing0 {
++		screen-type = <SCREEN_RGB>;
++		out-face    = <OUT_P888>;
++		clock-frequency = <27000000>;
++		hactive = <800>;
++		vactive = <480>;
++		hback-porch = <206>;
++		hfront-porch = <40>;
++		vback-porch = <25>;
++		vfront-porch = <10>;
++		hsync-len = <10>;
++		vsync-len = <10>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-tv080wum-mipi.dtsi b/include/dt-bindings/display/screen-timing/lcd-tv080wum-mipi.dtsi
+new file mode 100644
+index 0000000..9ae774c
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-tv080wum-mipi.dtsi
+@@ -0,0 +1,138 @@
++/*
++ * Copyright (C) 2014 ROCKCHIP, Inc.
++ * arch/arm/boot/dts/lcd-lq070m1sx01-mipi.dtsi
++ * author: libing@rock-chips.com
++ * create date: 2014-04-15
++ * lcd model: ld089wu1
++ * resolution: 1920 X 1200
++ * mipi channel: single
++ */
++
++/* about mipi */
++disp_mipi_init: mipi_dsi_init{
++			compatible = "rockchip,mipi_dsi_init";
++			rockchip,screen_init	= <0>;
++			rockchip,dsi_lane		= <4>;
++			rockchip,dsi_hs_clk		= <1000>;
++			rockchip,mipi_dsi_num	= <1>;
++};
++disp_mipi_power_ctr: mipi_power_ctr {
++			compatible = "rockchip,mipi_power_ctr";
++			/*mipi_lcd_rst:mipi_lcd_rst{
++					compatible = "rockchip,lcd_rst";
++					rockchip,gpios = <&gpio2 GPIO_B7 GPIO_ACTIVE_LOW>;
++					rockchip,delay = <100>;
++			};
++			mipi_lcd_en:mipi_lcd_en {
++					compatible = "rockchip,lcd_en";
++					rockchip,gpios = <&gpio0 GPIO_C1 GPIO_ACTIVE_HIGH>;
++					rockchip,delay = <100>;
++			};*/
++};
++disp_mipi_init_cmds: screen-on-cmds {
++			compatible = "rockchip,screen-on-cmds";
++			/*rockchip,cmd_debug = <1>;
++			rockchip,on-cmds1 {
++					compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <HSDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0xb0 0x02>;
++					rockchip,cmd_delay = <0>;
++			};
++			*/
++};
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        compatible = "rockchip,display-timings";
++        timing0: timing0 {
++		screen-type = <SCREEN_MIPI>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_P888>;
++		clock-frequency = <150000000>;
++		hactive = <1200>;
++		vactive = <1920>;
++		hback-porch = <80>;
++		hfront-porch = <81>;
++		vback-porch = <21>;
++		vfront-porch = <21>;
++		hsync-len = <10>;
++		vsync-len = <3>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++		cabc-lut = <
++			/*gamma = 2.2*/
++			0x00000383 0x00000392 0x000003a2 0x000003b2 0x000003c2 0x000003d2 0x000003e2 0x000003f3
++			0x00000403 0x00000414 0x00000425 0x00000436 0x00000447 0x00000458 0x0000046a 0x0000047b
++			0x0000048d 0x0000049f 0x000004b1 0x000004c3 0x000004d5 0x000004e8 0x000004fa 0x0000050d
++			0x00000520 0x00000533 0x00000546 0x0000055a 0x0000056d 0x00000581 0x00000595 0x000005a9
++			0x000005bd 0x000005d1 0x000005e5 0x000005fa 0x0000060f 0x00000624 0x00000639 0x0000064e
++			0x00000663 0x00000679 0x0000068e 0x000006a4 0x000006ba 0x000006d0 0x000006e6 0x000006fd
++			0x00000713 0x0000072a 0x00000741 0x00000758 0x0000076f 0x00000786 0x0000079e 0x000007b6
++			0x000007cd 0x000007e5 0x000007fd 0x00000816 0x0000082e 0x00000847 0x0000085f 0x00000878
++			0x00000891 0x000008ab 0x000008c4 0x000008de 0x000008f7 0x00000911 0x0000092b 0x00000945
++			0x00000960 0x0000097a 0x00000995 0x000009af 0x000009ca 0x000009e6 0x00000a01 0x00000a1c
++			0x00000a38 0x00000a54 0x00000a6f 0x00000a8c 0x00000aa8 0x00000ac4 0x00000ae1 0x00000afd
++			0x00000b1a 0x00000b37 0x00000b54 0x00000b72 0x00000b8f 0x00000bad 0x00000bcb 0x00000be9
++			0x00000c07 0x00000c25 0x00000c44 0x00000c62 0x00000c81 0x00000ca0 0x00000cbf 0x00000cdf
++			0x00000cfe 0x00000d1e 0x00000d3e 0x00000d5d 0x00000d7e 0x00000d9e 0x00000dbe 0x00000ddf
++			0x00000e00 0x00000e21 0x00000e42 0x00000e63 0x00000e84 0x00000ea6 0x00000ec8 0x00000eea
++			0x00000f0c 0x00000f2e 0x00000f50 0x00000f73 0x00000f96 0x00000fb9 0x00000fdc 0x00000fff
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000>;
++		cabc-gamma-base = <
++			/*gamma = 2.2*/
++			0x00010000 0x0000fdd0 0x0000fba8 0x0000f986 0x0000f76a 0x0000f556 0x0000f347 0x0000f140
++			0x0000ef3e 0x0000ed43 0x0000eb4e 0x0000e95e 0x0000e775 0x0000e592 0x0000e3b4 0x0000e1dc
++			0x0000e009 0x0000de3c 0x0000dc74 0x0000dab2 0x0000d8f4 0x0000d73c 0x0000d589 0x0000d3db
++			0x0000d232 0x0000d08d 0x0000ceee 0x0000cd53 0x0000cbbc 0x0000ca2b 0x0000c89d 0x0000c714
++			0x0000c590 0x0000c410 0x0000c294 0x0000c11c 0x0000bfa8 0x0000be39 0x0000bccd 0x0000bb65
++			0x0000ba01 0x0000b8a1 0x0000b745 0x0000b5ed 0x0000b498 0x0000b347 0x0000b1f9 0x0000b0af
++			0x0000af68 0x0000ae25 0x0000ace5 0x0000aba8 0x0000aa6f 0x0000a939 0x0000a806 0x0000a6d7
++			0x0000a5aa 0x0000a480 0x0000a35a 0x0000a236 0x0000a116 0x00009ff8 0x00009edd 0x00009dc5
++			0x00009cb0 0x00009b9e 0x00009a8e 0x00009981 0x00009877 0x0000976f 0x0000966a 0x00009567
++			0x00009467 0x0000936a 0x0000926f 0x00009176 0x00009080 0x00008f8c 0x00008e9a 0x00008dab
++			0x00008cbe 0x00008bd3 0x00008aea 0x00008a04 0x00008920 0x0000883e 0x0000875e 0x00008680
++			0x000085a4 0x000084ca 0x000083f3 0x0000831d 0x00008249 0x00008177 0x000080a7 0x00007fd9
++			0x00007f0d 0x00007e42 0x00007d7a 0x00007cb3 0x00007bee 0x00007b2b 0x00007a6a 0x000079aa
++			0x000078ec 0x0000782f 0x00007775 0x000076bc 0x00007604 0x0000754f 0x0000749a 0x000073e8
++			0x00007337 0x00007287 0x000071d9 0x0000712c 0x00007081 0x00006fd8 0x00006f30 0x00006e89
++			0x00006de4 0x00006d40 0x00006c9d 0x00006bfc 0x00006b5c 0x00006abe 0x00006a21 0x00006985
++			0x000068ea 0x00006851 0x000067b9 0x00006722 0x0000668d 0x000065f9 0x00006566 0x000064d4
++			0x00006443 0x000063b4 0x00006325 0x00006298 0x0000620c 0x00006181 0x000060f8 0x0000606f
++			0x00005fe7 0x00005f61 0x00005edb 0x00005e57 0x00005dd4 0x00005d51 0x00005cd0 0x00005c50
++			0x00005bd1 0x00005b52 0x00005ad5 0x00005a59 0x000059de 0x00005963 0x000058ea 0x00005871
++			0x000057fa 0x00005783 0x0000570d 0x00005699 0x00005625 0x000055b2 0x0000553f 0x000054ce
++			0x0000545d 0x000053ee 0x0000537f 0x00005311 0x000052a4 0x00005238 0x000051cc 0x00005161
++			0x000050f7 0x0000508e 0x00005026 0x00004fbe 0x00004f57 0x00004ef1 0x00004e8c 0x00004e27
++			0x00004dc3 0x00004d60 0x00004cfe 0x00004c9c 0x00004c3b 0x00004bdb 0x00004b7b 0x00004b1c
++			0x00004abe 0x00004a60 0x00004a03 0x000049a7 0x0000494b 0x000048f0 0x00004896 0x0000483c
++			0x000047e3 0x0000478a 0x00004733 0x000046db 0x00004685 0x0000462f 0x000045d9 0x00004584
++			0x00004530 0x000044dc 0x00004489 0x00004437 0x000043e5 0x00004393 0x00004342 0x000042f2
++			0x000042a2 0x00004253 0x00004204 0x000041b6 0x00004169 0x0000411b 0x000040cf 0x00004083
++			0x00004037 0x00003fec 0x00003fa1 0x00003f57 0x00003f0e 0x00003ec5 0x00003e7c 0x00003e34
++			0x00003dec 0x00003da5 0x00003d5e 0x00003d18 0x00003cd2 0x00003c8c 0x00003c48 0x00003c03
++			0x00003bbf 0x00003b7b 0x00003b38 0x00003af5 0x00003ab3 0x00003a71 0x00003a30 0x000039ef
++			0x000039ae 0x0000396e 0x0000392e 0x000038ee 0x000038af 0x00003871 0x00003832 0x000037f5>;
++			};
++	};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-tv080wum-nl0-mipi.dtsi b/include/dt-bindings/display/screen-timing/lcd-tv080wum-nl0-mipi.dtsi
+new file mode 100644
+index 0000000..b408d65
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-tv080wum-nl0-mipi.dtsi
+@@ -0,0 +1,179 @@
++/*
++ * Copyright (c) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This file is dual-licensed: you can use it either under the terms
++ * of the GPL or the X11 license, at your option. Note that this dual
++ * licensing only applies to this file, and not this project as a
++ * whole.
++ *
++ *  a) This file is free software; you can redistribute it and/or
++ *     modify it under the terms of the GNU General Public License as
++ *     published by the Free Software Foundation; either version 2 of the
++ *     License, or (at your option) any later version.
++ *
++ *     This file is distributed in the hope that it will be useful,
++ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *     GNU General Public License for more details.
++ *
++ * Or, alternatively,
++ *
++ *  b) Permission is hereby granted, free of charge, to any person
++ *     obtaining a copy of this software and associated documentation
++ *     files (the "Software"), to deal in the Software without
++ *     restriction, including without limitation the rights to use,
++ *     copy, modify, merge, publish, distribute, sublicense, and/or
++ *     sell copies of the Software, and to permit persons to whom the
++ *     Software is furnished to do so, subject to the following
++ *     conditions:
++ *
++ *     The above copyright notice and this permission notice shall be
++ *     included in all copies or substantial portions of the Software.
++ *
++ *     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ *     EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
++ *     OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ *     NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++ *     HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ *     WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ *     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ *     OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * include/dt-bindings/display/screen-timing/lcd-tv080wum-nl0-mipi.dtsi
++ * author: hjc@rock-chips.com
++ * create date: 2016-03-28
++ * lcd model: tv080wum-n10
++ * resolution: 1200 * 1920
++ * mipi channel: single
++ */
++
++/* about mipi */
++disp_mipi_init: mipi_dsi_init{
++	compatible = "rockchip,mipi_dsi_init";
++	rockchip,screen_init	= <0>;
++	rockchip,dsi_lane	= <4>;
++	rockchip,dsi_hs_clk	= <1200>;
++	rockchip,mipi_dsi_num	= <1>;
++};
++
++disp_mipi_power_ctr: mipi_power_ctr {
++	compatible = "rockchip,mipi_power_ctr";
++	/* mipi_lcd_rst:mipi_lcd_rst{
++			compatible = "rockchip,lcd_rst";
++			rockchip,gpios = <&gpio2 GPIO_B7 GPIO_ACTIVE_LOW>;
++			rockchip,delay = <100>;
++	};
++	mipi_lcd_en:mipi_lcd_en {
++			compatible = "rockchip,lcd_en";
++			rockchip,gpios = <&gpio0 GPIO_C1 GPIO_ACTIVE_HIGH>;
++			rockchip,delay = <100>;
++	};
++	*/
++};
++
++disp_mipi_init_cmds: screen-on-cmds {
++	compatible = "rockchip,screen-on-cmds";
++	/* rockchip,cmd_debug = <1>;
++	rockchip,on-cmds1 {
++			compatible = "rockchip,on-cmds";
++			rockchip,cmd_type = <HSDT>;
++			rockchip,dsi_id = <2>;
++			rockchip,cmd = <0xb0 0x02>;
++			rockchip,cmd_delay = <0>;
++	};
++	*/
++};
++
++disp_timings: display-timings {
++	native-mode = <&timing0>;
++	compatible = "rockchip,display-timings";
++	timing0: timing0 {
++		screen-type = <SCREEN_MIPI>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_P888>;
++		clock-frequency = <160000000>;
++		hactive = <1200>;
++		vactive = <1920>;
++		hback-porch = <21>;
++		hfront-porch = <120>;
++		vback-porch = <18>;
++		vfront-porch = <21>;
++		hsync-len = <20>;
++		vsync-len = <3>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++		cabc-lut = <
++			/*gamma = 2.2*/
++			0x00000383 0x00000392 0x000003a2 0x000003b2 0x000003c2 0x000003d2 0x000003e2 0x000003f3
++			0x00000403 0x00000414 0x00000425 0x00000436 0x00000447 0x00000458 0x0000046a 0x0000047b
++			0x0000048d 0x0000049f 0x000004b1 0x000004c3 0x000004d5 0x000004e8 0x000004fa 0x0000050d
++			0x00000520 0x00000533 0x00000546 0x0000055a 0x0000056d 0x00000581 0x00000595 0x000005a9
++			0x000005bd 0x000005d1 0x000005e5 0x000005fa 0x0000060f 0x00000624 0x00000639 0x0000064e
++			0x00000663 0x00000679 0x0000068e 0x000006a4 0x000006ba 0x000006d0 0x000006e6 0x000006fd
++			0x00000713 0x0000072a 0x00000741 0x00000758 0x0000076f 0x00000786 0x0000079e 0x000007b6
++			0x000007cd 0x000007e5 0x000007fd 0x00000816 0x0000082e 0x00000847 0x0000085f 0x00000878
++			0x00000891 0x000008ab 0x000008c4 0x000008de 0x000008f7 0x00000911 0x0000092b 0x00000945
++			0x00000960 0x0000097a 0x00000995 0x000009af 0x000009ca 0x000009e6 0x00000a01 0x00000a1c
++			0x00000a38 0x00000a54 0x00000a6f 0x00000a8c 0x00000aa8 0x00000ac4 0x00000ae1 0x00000afd
++			0x00000b1a 0x00000b37 0x00000b54 0x00000b72 0x00000b8f 0x00000bad 0x00000bcb 0x00000be9
++			0x00000c07 0x00000c25 0x00000c44 0x00000c62 0x00000c81 0x00000ca0 0x00000cbf 0x00000cdf
++			0x00000cfe 0x00000d1e 0x00000d3e 0x00000d5d 0x00000d7e 0x00000d9e 0x00000dbe 0x00000ddf
++			0x00000e00 0x00000e21 0x00000e42 0x00000e63 0x00000e84 0x00000ea6 0x00000ec8 0x00000eea
++			0x00000f0c 0x00000f2e 0x00000f50 0x00000f73 0x00000f96 0x00000fb9 0x00000fdc 0x00000fff
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
++			0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000>;
++		cabc-gamma-base = <
++			/*gamma = 2.2*/
++			0x00010000 0x0000fdd0 0x0000fba8 0x0000f986 0x0000f76a 0x0000f556 0x0000f347 0x0000f140
++			0x0000ef3e 0x0000ed43 0x0000eb4e 0x0000e95e 0x0000e775 0x0000e592 0x0000e3b4 0x0000e1dc
++			0x0000e009 0x0000de3c 0x0000dc74 0x0000dab2 0x0000d8f4 0x0000d73c 0x0000d589 0x0000d3db
++			0x0000d232 0x0000d08d 0x0000ceee 0x0000cd53 0x0000cbbc 0x0000ca2b 0x0000c89d 0x0000c714
++			0x0000c590 0x0000c410 0x0000c294 0x0000c11c 0x0000bfa8 0x0000be39 0x0000bccd 0x0000bb65
++			0x0000ba01 0x0000b8a1 0x0000b745 0x0000b5ed 0x0000b498 0x0000b347 0x0000b1f9 0x0000b0af
++			0x0000af68 0x0000ae25 0x0000ace5 0x0000aba8 0x0000aa6f 0x0000a939 0x0000a806 0x0000a6d7
++			0x0000a5aa 0x0000a480 0x0000a35a 0x0000a236 0x0000a116 0x00009ff8 0x00009edd 0x00009dc5
++			0x00009cb0 0x00009b9e 0x00009a8e 0x00009981 0x00009877 0x0000976f 0x0000966a 0x00009567
++			0x00009467 0x0000936a 0x0000926f 0x00009176 0x00009080 0x00008f8c 0x00008e9a 0x00008dab
++			0x00008cbe 0x00008bd3 0x00008aea 0x00008a04 0x00008920 0x0000883e 0x0000875e 0x00008680
++			0x000085a4 0x000084ca 0x000083f3 0x0000831d 0x00008249 0x00008177 0x000080a7 0x00007fd9
++			0x00007f0d 0x00007e42 0x00007d7a 0x00007cb3 0x00007bee 0x00007b2b 0x00007a6a 0x000079aa
++			0x000078ec 0x0000782f 0x00007775 0x000076bc 0x00007604 0x0000754f 0x0000749a 0x000073e8
++			0x00007337 0x00007287 0x000071d9 0x0000712c 0x00007081 0x00006fd8 0x00006f30 0x00006e89
++			0x00006de4 0x00006d40 0x00006c9d 0x00006bfc 0x00006b5c 0x00006abe 0x00006a21 0x00006985
++			0x000068ea 0x00006851 0x000067b9 0x00006722 0x0000668d 0x000065f9 0x00006566 0x000064d4
++			0x00006443 0x000063b4 0x00006325 0x00006298 0x0000620c 0x00006181 0x000060f8 0x0000606f
++			0x00005fe7 0x00005f61 0x00005edb 0x00005e57 0x00005dd4 0x00005d51 0x00005cd0 0x00005c50
++			0x00005bd1 0x00005b52 0x00005ad5 0x00005a59 0x000059de 0x00005963 0x000058ea 0x00005871
++			0x000057fa 0x00005783 0x0000570d 0x00005699 0x00005625 0x000055b2 0x0000553f 0x000054ce
++			0x0000545d 0x000053ee 0x0000537f 0x00005311 0x000052a4 0x00005238 0x000051cc 0x00005161
++			0x000050f7 0x0000508e 0x00005026 0x00004fbe 0x00004f57 0x00004ef1 0x00004e8c 0x00004e27
++			0x00004dc3 0x00004d60 0x00004cfe 0x00004c9c 0x00004c3b 0x00004bdb 0x00004b7b 0x00004b1c
++			0x00004abe 0x00004a60 0x00004a03 0x000049a7 0x0000494b 0x000048f0 0x00004896 0x0000483c
++			0x000047e3 0x0000478a 0x00004733 0x000046db 0x00004685 0x0000462f 0x000045d9 0x00004584
++			0x00004530 0x000044dc 0x00004489 0x00004437 0x000043e5 0x00004393 0x00004342 0x000042f2
++			0x000042a2 0x00004253 0x00004204 0x000041b6 0x00004169 0x0000411b 0x000040cf 0x00004083
++			0x00004037 0x00003fec 0x00003fa1 0x00003f57 0x00003f0e 0x00003ec5 0x00003e7c 0x00003e34
++			0x00003dec 0x00003da5 0x00003d5e 0x00003d18 0x00003cd2 0x00003c8c 0x00003c48 0x00003c03
++			0x00003bbf 0x00003b7b 0x00003b38 0x00003af5 0x00003ab3 0x00003a71 0x00003a30 0x000039ef
++			0x000039ae 0x0000396e 0x0000392e 0x000038ee 0x000038af 0x00003871 0x00003832 0x000037f5>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-vga.dtsi b/include/dt-bindings/display/screen-timing/lcd-vga.dtsi
+new file mode 100644
+index 0000000..8f0c8ea
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-vga.dtsi
+@@ -0,0 +1,73 @@
++/*
++ * RockChip. VGA timing
++ *
++ */
++
++disp_timings: display-timings {
++	native-mode = <&timing1>;
++	timing0: timing0 {
++		screen-type = <SCREEN_RGB>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face = <OUT_D888_P666>;
++		clock-frequency = <65000000>;
++		hactive = <1024>;
++		vactive = <768>;
++		hback-porch = <160>;
++		hfront-porch = <24>;
++		vback-porch = <29>;
++		vfront-porch = <3>;
++		hsync-len = <136>;
++		vsync-len = <6>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <1>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++
++	timing1: timing1 {
++		screen-type = <SCREEN_RGB>;
++		out-face = <OUT_D888_P666>;
++		lvds-format = <LVDS_8BIT_2>;
++		clock-frequency = <88750000>;
++		hactive = <1440>;
++		vactive = <900>;
++		hback-porch = <80>;
++		hfront-porch = <48>;
++		vback-porch = <17>;
++		vfront-porch = <3>;
++		hsync-len = <32>;
++		vsync-len = <6>;
++		hsync-active = <1>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <1>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++
++	timing2: timing2 {
++		screen-type = <SCREEN_RGB>;
++		out-face = <OUT_D888_P666>;
++		lvds-format = <LVDS_8BIT_2>;
++		clock-frequency = <106500000>;
++		hactive = <1440>;
++		vactive = <900>;
++		hback-porch = <232>;
++		hfront-porch = <80>;
++		vback-porch = <25>;
++		vfront-porch = <3>;
++		hsync-len = <152>;
++		vsync-len = <6>;
++		hsync-active = <0>;
++		vsync-active = <1>;
++		de-active = <0>;
++		pixelclk-active = <1>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-wqxga-mipi.dtsi b/include/dt-bindings/display/screen-timing/lcd-wqxga-mipi.dtsi
+new file mode 100644
+index 0000000..270e98d
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-wqxga-mipi.dtsi
+@@ -0,0 +1,204 @@
++/*
++ * Copyright (C) 2014 ROCKCHIP, Inc.
++ * arch/arm/boot/dts/lcd-lq070m1sx01-mipi.dtsi
++ * author: libing@rock-chips.com
++ * create date: 2014-04-15
++ * lcd model: wqxga
++ * resolution: 2560 X 1600
++ * mipi channel: dual
++ */
++
++/* about mipi */
++disp_mipi_init: mipi_dsi_init{
++			compatible = "rockchip,mipi_dsi_init";
++			rockchip,screen_init	= <1>;
++			rockchip,dsi_lane		= <4>;
++			rockchip,dsi_hs_clk		= <940>;
++			rockchip,mipi_dsi_num	= <2>;
++};
++disp_mipi_power_ctr: mipi_power_ctr {
++                        compatible = "rockchip,mipi_power_ctr";
++			mipi_lcd_rst:mipi_lcd_rst{
++			        compatible = "rockchip,lcd_rst";
++					rockchip,gpios = <&gpio7 GPIO_B2 GPIO_ACTIVE_HIGH>;
++					rockchip,delay = <10>;
++			};
++			mipi_lcd_en:mipi_lcd_en {
++			        compatible = "rockchip,lcd_en";
++					rockchip,gpios = <&gpio6 GPIO_A7 GPIO_ACTIVE_HIGH>;
++					rockchip,delay = <10>;
++			};
++};
++disp_mipi_init_cmds: screen-on-cmds {
++			rockchip,cmd_debug = <0>;
++			compatible = "rockchip,screen-on-cmds";
++	                rockchip,on-cmds1 {
++                                        compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x05 0x01>; //set soft reset
++					rockchip,cmd_delay = <10>;
++			};
++
++	                rockchip,on-cmds2 {
++                                        compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x05 0x01>; //set soft reset
++					rockchip,cmd_delay = <10>;
++			};
++			rockchip,on-cmds3 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0x3a 0x77>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds4 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x39 0x2a 0x00 0x00 0x04 0xff>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds5 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x39 0x2b 0x00 0x00 0x06 0x3f>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds6 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <0>;
++					rockchip,cmd = <0x15 0x35 0x00>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds7 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <0>;
++					rockchip,cmd = <0x39 0x44 0x00 0x00>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds8 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0x51 0xff>; //0xff
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds9 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0x53 0x04>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds10 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0x51 0xff>; //0xff
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds11 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0x53 0x04>;
++					rockchip,cmd_delay = <0>;
++			};
++
++			rockchip,on-cmds12 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x15 0x55 0x00>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds13 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x05 dcs_exit_sleep_mode>;
++					rockchip,cmd_delay = <120>;
++			};
++
++			rockchip,on-cmds14 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x23 0xb0 0x00>;
++					rockchip,cmd_delay = <0>;
++			};
++
++			rockchip,on-cmds15 { //video
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x29 0xb3 0x1c>;
++					rockchip,cmd_delay = <0>;
++			};
++
++			rockchip,on-cmds16 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x29 0xce 0x7d 0x40 0x48 0x56 0x67 0x78 0x88 0x98 0xa7 0xb5 0xc3 0xd1 0xde 0xe9 0xf2 0xfa 0xff 0x04 0x00>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds17 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x23 0xb0 0x03>;
++					rockchip,cmd_delay = <0>;
++			};
++			rockchip,on-cmds18 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x39 0x2c >;
++					rockchip,cmd_delay = <0>;
++			};
++
++			rockchip,on-cmds19 {
++			                compatible = "rockchip,on-cmds";
++					rockchip,cmd_type = <LPDT>;
++					rockchip,dsi_id = <2>;
++					rockchip,cmd = <0x05 dcs_set_display_on>;
++					rockchip,cmd_delay = <10>;
++			};
++
++};
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        compatible = "rockchip,display-timings";
++        timing0: timing0 {
++		screen-type = <SCREEN_DUAL_MIPI>;
++		lvds-format = <LVDS_8BIT_2>;
++		out-face    = <OUT_P888>;
++		clock-frequency = <265000000>;
++		hactive = <2560>;
++		vactive = <1600>;
++
++		hsync-len = <38>;//19
++		hback-porch = <40>;//40
++		hfront-porch = <108>;//123
++
++		vsync-len = <4>;
++		vback-porch = <4>;
++		vfront-porch = <12>;
++
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/display/screen-timing/lcd-y81349.dtsi b/include/dt-bindings/display/screen-timing/lcd-y81349.dtsi
+new file mode 100644
+index 0000000..fabaf6d
+--- /dev/null
++++ b/include/dt-bindings/display/screen-timing/lcd-y81349.dtsi
+@@ -0,0 +1,29 @@
++/*
++ * RockChip. LCD_Y81349 FOR 86V
++ *
++ */
++
++
++disp_timings: display-timings {
++        native-mode = <&timing0>;
++        timing0: timing0 {
++		screen-type = <SCREEN_RGB>;
++		out-face    = <OUT_P666>;
++		clock-frequency = <33000000>;
++		hactive = <800>;
++		vactive = <480>;
++		hback-porch = <10>;
++		hfront-porch = <210>;
++		vback-porch = <10>;
++		vfront-porch = <22>;
++		hsync-len = <30>;
++		vsync-len = <13>;
++		hsync-active = <0>;
++		vsync-active = <0>;
++		de-active = <0>;
++		pixelclk-active = <0>;
++		swap-rb = <0>;
++		swap-rg = <0>;
++		swap-gb = <0>;
++	};
++};
+diff --git a/include/dt-bindings/soc/rockchip_boot-mode.h b/include/dt-bindings/soc/rockchip_boot-mode.h
+new file mode 100644
+index 0000000..cb7a60a
+--- /dev/null
++++ b/include/dt-bindings/soc/rockchip_boot-mode.h
+@@ -0,0 +1,17 @@
++#ifndef __ROCKCHIP_BOOT_MODE_H
++#define __ROCKCHIP_BOOT_MODE_H
++
++/* high 24 bits is tag, low 8 bits is type */
++#define REBOOT_FLAG		0x5242C300
++/* normal boot */
++#define BOOT_NORMAL		(REBOOT_FLAG + 0)
++/* enter loader rockusb mode */
++#define BOOT_LOADER		(REBOOT_FLAG + 1)
++/* enter recovery */
++#define BOOT_RECOVERY		(REBOOT_FLAG + 3)
++/* enter fastboot mode */
++#define BOOT_FASTBOOT		(REBOOT_FLAG + 9)
++/* enter charging mode */
++#define BOOT_CHARGING		(REBOOT_FLAG + 11)
++
++#endif

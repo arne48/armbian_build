@@ -1,0 +1,13 @@
+diff --git a/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_devfreq.c b/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_devfreq.c
+index 219852b..5ee1301 100644
+--- a/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_devfreq.c
++++ b/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_devfreq.c
+@@ -17,7 +17,7 @@
+ #define ENABLE_DEBUG_LOG
+ #include "../../platform/rk/custom_log.h"
+ 
+-
++#include <linux/of.h>
+ #include <mali_kbase.h>
+ #include <mali_kbase_config_defaults.h>
+ #include <backend/gpu/mali_kbase_pm_internal.h>
