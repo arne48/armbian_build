@@ -1,0 +1,538 @@
+diff --git a/drivers/mmc/core/bus.c b/drivers/mmc/core/bus.c
+index 972ff84..c40d700 100644
+--- a/drivers/mmc/core/bus.c
++++ b/drivers/mmc/core/bus.c
+@@ -332,12 +332,13 @@ int mmc_add_card(struct mmc_card *card)
+ 			mmc_card_ddr52(card) ? "DDR " : "",
+ 			type);
+ 	} else {
+-		pr_info("%s: new %s%s%s%s%s card at address %04x\n",
++		pr_info("%s: new %s%s%s%s%s%s card at address %04x\n",
+ 			mmc_hostname(card->host),
+ 			mmc_card_uhs(card) ? "ultra high speed " :
+ 			(mmc_card_hs(card) ? "high speed " : ""),
+ 			mmc_card_hs400(card) ? "HS400 " :
+ 			(mmc_card_hs200(card) ? "HS200 " : ""),
++			mmc_card_hs400es(card) ? "Enhanced strobe " : "",
+ 			mmc_card_ddr52(card) ? "DDR " : "",
+ 			uhs_bus_speed_mode, type, card->rca);
+ 	}
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 5f7d10b..510640f 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -30,6 +30,9 @@
+ #include <linux/slab.h>
+ #include <linux/of.h>
+ 
++#define CREATE_TRACE_POINTS
++#include <trace/events/mmc.h>
++
+ #include <linux/mmc/card.h>
+ #include <linux/mmc/host.h>
+ #include <linux/mmc/mmc.h>
+@@ -46,6 +49,11 @@
+ #include "sd_ops.h"
+ #include "sdio_ops.h"
+ 
++EXPORT_TRACEPOINT_SYMBOL_GPL(mmc_blk_erase_start);
++EXPORT_TRACEPOINT_SYMBOL_GPL(mmc_blk_erase_end);
++EXPORT_TRACEPOINT_SYMBOL_GPL(mmc_blk_rw_start);
++EXPORT_TRACEPOINT_SYMBOL_GPL(mmc_blk_rw_end);
++
+ /* If the device is not responding */
+ #define MMC_CORE_TIMEOUT_MS	(10 * 60 * 1000) /* 10 minute timeout */
+ 
+@@ -55,7 +63,6 @@
+  */
+ #define MMC_BKOPS_MAX_TIMEOUT	(4 * 60 * 1000) /* max time to wait in ms */
+ 
+-static struct workqueue_struct *workqueue;
+ static const unsigned freqs[] = { 400000, 300000, 200000, 100000 };
+ 
+ /*
+@@ -66,21 +73,16 @@ static const unsigned freqs[] = { 400000, 300000, 200000, 100000 };
+ bool use_spi_crc = 1;
+ module_param(use_spi_crc, bool, 0);
+ 
+-/*
+- * Internal function. Schedule delayed work in the MMC work queue.
+- */
+ static int mmc_schedule_delayed_work(struct delayed_work *work,
+ 				     unsigned long delay)
+ {
+-	return queue_delayed_work(workqueue, work, delay);
+-}
+-
+-/*
+- * Internal function. Flush all scheduled work from the MMC work queue.
+- */
+-static void mmc_flush_scheduled_work(void)
+-{
+-	flush_workqueue(workqueue);
++	/*
++	 * We use the system_freezable_wq, because of two reasons.
++	 * First, it allows several works (not the same work item) to be
++	 * executed simultaneously. Second, the queue becomes frozen when
++	 * userspace becomes frozen during system PM.
++	 */
++	return queue_delayed_work(system_freezable_wq, work, delay);
+ }
+ 
+ #ifdef CONFIG_FAIL_MMC_REQUEST
+@@ -136,7 +138,8 @@ void mmc_request_done(struct mmc_host *host, struct mmc_request *mrq)
+ 	/* Flag re-tuning needed on CRC errors */
+ 	if ((cmd->opcode != MMC_SEND_TUNING_BLOCK &&
+ 	    cmd->opcode != MMC_SEND_TUNING_BLOCK_HS200) &&
+-	    (err == -EILSEQ || (mrq->sbc && mrq->sbc->error == -EILSEQ) ||
++	    (err == -EIO || err == -EILSEQ ||
++	    (mrq->sbc && mrq->sbc->error == -EILSEQ) ||
+ 	    (mrq->data && mrq->data->error == -EILSEQ) ||
+ 	    (mrq->stop && mrq->stop->error == -EILSEQ)))
+ 		mmc_retune_needed(host);
+@@ -175,6 +178,7 @@ void mmc_request_done(struct mmc_host *host, struct mmc_request *mrq)
+ 			pr_debug("%s:     %d bytes transferred: %d\n",
+ 				mmc_hostname(host),
+ 				mrq->data->bytes_xfered, mrq->data->error);
++			trace_mmc_blk_rw_end(cmd->opcode, cmd->arg, mrq->data);
+ 		}
+ 
+ 		if (mrq->stop) {
+@@ -617,8 +621,12 @@ struct mmc_async_req *mmc_start_req(struct mmc_host *host,
+ 		}
+ 	}
+ 
+-	if (!err && areq)
++	if (!err && areq) {
++		trace_mmc_blk_rw_start(areq->mrq->cmd->opcode,
++				       areq->mrq->cmd->arg,
++				       areq->mrq->data);
+ 		start_err = __mmc_start_data_req(host, areq->mrq);
++	}
+ 
+ 	if (host->areq)
+ 		mmc_post_req(host, host->areq->mrq, 0);
+@@ -1125,6 +1133,11 @@ void mmc_set_initial_state(struct mmc_host *host)
+ 	host->ios.bus_width = MMC_BUS_WIDTH_1;
+ 	host->ios.timing = MMC_TIMING_LEGACY;
+ 	host->ios.drv_type = 0;
++	host->ios.enhanced_strobe = false;
++
++	if ((host->caps2 & MMC_CAP2_HS400_ES) &&
++		host->ops->hs400_enhanced_strobe)
++		host->ops->hs400_enhanced_strobe(host, &host->ios);
+ 
+ 	mmc_set_ios(host);
+ }
+@@ -2055,8 +2068,13 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
+ 	struct mmc_command cmd = {0};
+ 	unsigned int qty = 0;
+ 	unsigned long timeout;
++	unsigned int fr, nr;
+ 	int err;
+ 
++	fr = from;
++	nr = to - from + 1;
++	trace_mmc_blk_erase_start(arg, fr, nr);
++
+ 	mmc_retune_hold(card->host);
+ 
+ 	/*
+@@ -2163,6 +2181,7 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
+ 		 (R1_CURRENT_STATE(cmd.resp[0]) == R1_STATE_PRG));
+ out:
+ 	mmc_retune_release(card->host);
++	trace_mmc_blk_erase_end(arg, fr, nr);
+ 	return err;
+ }
+ 
+@@ -2477,6 +2496,7 @@ static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
+ 	 * if the card is being re-initialized, just send it.  CMD52
+ 	 * should be ignored by SD/eMMC cards.
+ 	 */
++#ifdef MMC_STANDARD_PROBE
+ 	sdio_reset(host);
+ 	mmc_go_idle(host);
+ 
+@@ -2489,7 +2509,26 @@ static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
+ 		return 0;
+ 	if (!mmc_attach_mmc(host))
+ 		return 0;
++#else
++	if (host->restrict_caps & RESTRICT_CARD_TYPE_SDIO)
++		sdio_reset(host);
+ 
++	mmc_go_idle(host);
++
++	if (host->restrict_caps &
++	    (RESTRICT_CARD_TYPE_SDIO | RESTRICT_CARD_TYPE_SD))
++		mmc_send_if_cond(host, host->ocr_avail);
++	/* Order's important: probe SDIO, then SD, then MMC */
++	if ((host->restrict_caps & RESTRICT_CARD_TYPE_SDIO) &&
++	    !mmc_attach_sdio(host))
++		return 0;
++	if ((host->restrict_caps & RESTRICT_CARD_TYPE_SD) &&
++	     !mmc_attach_sd(host))
++		return 0;
++	if ((host->restrict_caps & RESTRICT_CARD_TYPE_EMMC) &&
++	     !mmc_attach_mmc(host))
++		return 0;
++#endif
+ 	mmc_power_off(host);
+ 	return -EIO;
+ }
+@@ -2663,7 +2702,6 @@ void mmc_stop_host(struct mmc_host *host)
+ 
+ 	host->rescan_disable = 1;
+ 	cancel_delayed_work_sync(&host->detect);
+-	mmc_flush_scheduled_work();
+ 
+ 	/* clear pm flags now and let card drivers set them as needed */
+ 	host->pm_flags = 0;
+@@ -2748,8 +2786,9 @@ int mmc_flush_cache(struct mmc_card *card)
+ 	if (mmc_card_mmc(card) &&
+ 			(card->ext_csd.cache_size > 0) &&
+ 			(card->ext_csd.cache_ctrl & 1)) {
+-		err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+-				EXT_CSD_FLUSH_CACHE, 1, 0);
++		err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
++				   EXT_CSD_FLUSH_CACHE, 1, 1,
++				   true, false, false);
+ 		if (err)
+ 			pr_err("%s: cache flush error %d\n",
+ 					mmc_hostname(card->host), err);
+@@ -2832,17 +2871,29 @@ void mmc_init_context_info(struct mmc_host *host)
+ 	init_waitqueue_head(&host->context_info.wait);
+ }
+ 
++#ifdef CONFIG_MMC_EMBEDDED_SDIO
++void mmc_set_embedded_sdio_data(struct mmc_host *host,
++				struct sdio_cis *cis,
++				struct sdio_cccr *cccr,
++				struct sdio_embedded_func *funcs,
++				int num_funcs)
++{
++	host->embedded_sdio_data.cis = cis;
++	host->embedded_sdio_data.cccr = cccr;
++	host->embedded_sdio_data.funcs = funcs;
++	host->embedded_sdio_data.num_funcs = num_funcs;
++}
++
++EXPORT_SYMBOL(mmc_set_embedded_sdio_data);
++#endif
++
+ static int __init mmc_init(void)
+ {
+ 	int ret;
+ 
+-	workqueue = alloc_ordered_workqueue("kmmcd", 0);
+-	if (!workqueue)
+-		return -ENOMEM;
+-
+ 	ret = mmc_register_bus();
+ 	if (ret)
+-		goto destroy_workqueue;
++		return ret;
+ 
+ 	ret = mmc_register_host_class();
+ 	if (ret)
+@@ -2858,9 +2909,6 @@ unregister_host_class:
+ 	mmc_unregister_host_class();
+ unregister_bus:
+ 	mmc_unregister_bus();
+-destroy_workqueue:
+-	destroy_workqueue(workqueue);
+-
+ 	return ret;
+ }
+ 
+@@ -2869,7 +2917,6 @@ static void __exit mmc_exit(void)
+ 	sdio_unregister_bus();
+ 	mmc_unregister_host_class();
+ 	mmc_unregister_bus();
+-	destroy_workqueue(workqueue);
+ }
+ 
+ subsys_initcall(mmc_init);
+diff --git a/drivers/mmc/core/host.c b/drivers/mmc/core/host.c
+index da950c4..a346775 100644
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@ -289,6 +289,15 @@ int mmc_of_parse(struct mmc_host *host)
+ 		host->caps2 |= MMC_CAP2_HS400_1_8V | MMC_CAP2_HS200_1_8V_SDR;
+ 	if (of_property_read_bool(np, "mmc-hs400-1_2v"))
+ 		host->caps2 |= MMC_CAP2_HS400_1_2V | MMC_CAP2_HS200_1_2V_SDR;
++	if (of_property_read_bool(np, "mmc-hs400-enhanced-strobe"))
++		host->caps2 |= MMC_CAP2_HS400_ES;
++
++	if (of_property_read_bool(np, "supports-sd"))
++		host->restrict_caps |= RESTRICT_CARD_TYPE_SD;
++	if (of_property_read_bool(np, "supports-sdio"))
++		host->restrict_caps |= RESTRICT_CARD_TYPE_SDIO;
++	if (of_property_read_bool(np, "supports-emmc"))
++		host->restrict_caps |= RESTRICT_CARD_TYPE_EMMC;
+ 
+ 	host->dsr_req = !of_property_read_u32(np, "dsr", &host->dsr);
+ 	if (host->dsr_req && (host->dsr & ~0xffff)) {
+@@ -377,6 +386,7 @@ EXPORT_SYMBOL(mmc_alloc_host);
+  *	prepared to start servicing requests before this function
+  *	completes.
+  */
++struct mmc_host *primary_sdio_host;
+ int mmc_add_host(struct mmc_host *host)
+ {
+ 	int err;
+@@ -395,7 +405,11 @@ int mmc_add_host(struct mmc_host *host)
+ #endif
+ 
+ 	mmc_start_host(host);
+-	register_pm_notifier(&host->pm_notify);
++	if (!(host->pm_flags & MMC_PM_IGNORE_PM_NOTIFY))
++		register_pm_notifier(&host->pm_notify);
++
++	if (host->restrict_caps & RESTRICT_CARD_TYPE_SDIO)
++		primary_sdio_host = host;
+ 
+ 	return 0;
+ }
+@@ -412,7 +426,9 @@ EXPORT_SYMBOL(mmc_add_host);
+  */
+ void mmc_remove_host(struct mmc_host *host)
+ {
+-	unregister_pm_notifier(&host->pm_notify);
++	if (!(host->pm_flags & MMC_PM_IGNORE_PM_NOTIFY))
++		unregister_pm_notifier(&host->pm_notify);
++
+ 	mmc_stop_host(host);
+ 
+ #ifdef CONFIG_DEBUG_FS
+@@ -439,3 +455,45 @@ void mmc_free_host(struct mmc_host *host)
+ }
+ 
+ EXPORT_SYMBOL(mmc_free_host);
++
++/**
++ * mmc_host_rescan - triger software rescan flow
++ * @host: mmc host
++ *
++ * rescan slot attach in the assigned host.
++ * If @host is NULL, default rescan primary_sdio_host
++ * saved by mmc_add_host().
++ * OR, rescan host from argument.
++ *
++ */
++int mmc_host_rescan(struct mmc_host *host, int val, int is_cap_sdio_irq)
++{
++	if (NULL != primary_sdio_host) {
++		if (!host)
++			  host = primary_sdio_host;
++		else
++			pr_info("%s: mmc_host_rescan pass in host from argument!\n",
++				mmc_hostname(host));
++	} else {
++		pr_err("sdio: host isn't  initialization successfully.\n");
++		return -ENOMEDIUM;
++	}
++
++	pr_info("%s:mmc host rescan start!\n", mmc_hostname(host));
++
++	/*  0: oob  1:cap-sdio-irq */
++	if (is_cap_sdio_irq == 1) {
++		host->caps |= MMC_CAP_SDIO_IRQ;
++	} else if (is_cap_sdio_irq == 0) {
++		host->caps &= ~MMC_CAP_SDIO_IRQ;
++	} else {
++		dev_err(&host->class_dev, "sdio: host doesn't identify oob or sdio_irq mode!\n");
++		return -ENOMEDIUM;
++	}
++
++	if (!(host->caps & MMC_CAP_NONREMOVABLE) && host->ops->set_sdio_status)
++		host->ops->set_sdio_status(host, val);
++
++	return 0;
++}
++EXPORT_SYMBOL(mmc_host_rescan);
+diff --git a/drivers/mmc/core/mmc.c b/drivers/mmc/core/mmc.c
+index 79a0c26..e26379d 100644
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -235,6 +235,11 @@ static void mmc_select_card_type(struct mmc_card *card)
+ 		avail_type |= EXT_CSD_CARD_TYPE_HS400_1_2V;
+ 	}
+ 
++	if ((caps2 & MMC_CAP2_HS400_ES) &&
++		card->ext_csd.strobe_support &&
++		(avail_type & EXT_CSD_CARD_TYPE_HS400))
++		avail_type |= EXT_CSD_CARD_TYPE_HS400ES;
++
+ 	card->ext_csd.hs_max_dtr = hs_max_dtr;
+ 	card->ext_csd.hs200_max_dtr = hs200_max_dtr;
+ 	card->mmc_avail_type = avail_type;
+@@ -386,6 +391,13 @@ static int mmc_decode_ext_csd(struct mmc_card *card, u8 *ext_csd)
+ 			mmc_card_set_blockaddr(card);
+ 	}
+ 
++	/*
++	 * Enhance Strobe is supported since v5.1 which rev should be
++	 * 8 but some eMMC devices can support it with rev 7. So handle
++	 * Enhance Strobe here.
++	 */
++	card->ext_csd.strobe_support = ext_csd[EXT_CSD_STROBE_SUPPORT];
++
+ 	card->ext_csd.raw_card_type = ext_csd[EXT_CSD_CARD_TYPE];
+ 	mmc_select_card_type(card);
+ 
+@@ -1078,16 +1090,12 @@ static int mmc_select_hs400(struct mmc_card *card)
+ 	if (host->caps & MMC_CAP_WAIT_WHILE_BUSY)
+ 		send_status = false;
+ 
+-	/* Reduce frequency to HS frequency */
+-	max_dtr = card->ext_csd.hs_max_dtr;
+-	mmc_set_clock(host, max_dtr);
+-
+ 	/* Switch card to HS mode */
+ 	val = EXT_CSD_TIMING_HS;
+ 	err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+ 			   EXT_CSD_HS_TIMING, val,
+ 			   card->ext_csd.generic_cmd6_time,
+-			   true, send_status, true);
++			   true, false, true);
+ 	if (err) {
+ 		pr_err("%s: switch to high-speed from hs200 failed, err:%d\n",
+ 			mmc_hostname(host), err);
+@@ -1097,6 +1105,10 @@ static int mmc_select_hs400(struct mmc_card *card)
+ 	/* Set host controller to HS timing */
+ 	mmc_set_timing(card->host, MMC_TIMING_MMC_HS);
+ 
++	/* Reduce frequency to HS frequency */
++	max_dtr = card->ext_csd.hs_max_dtr;
++	mmc_set_clock(host, max_dtr);
++
+ 	if (!send_status) {
+ 		err = mmc_switch_status(card);
+ 		if (err)
+@@ -1169,7 +1181,7 @@ int mmc_hs400_to_hs200(struct mmc_card *card)
+ 	val = EXT_CSD_TIMING_HS;
+ 	err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_HS_TIMING,
+ 			   val, card->ext_csd.generic_cmd6_time,
+-			   true, send_status, true);
++			   true, false, true);
+ 	if (err)
+ 		goto out_err;
+ 
+@@ -1281,7 +1293,7 @@ static int mmc_select_hs200(struct mmc_card *card)
+ 		err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+ 				   EXT_CSD_HS_TIMING, val,
+ 				   card->ext_csd.generic_cmd6_time,
+-				   true, send_status, true);
++				   true, false, true);
+ 		if (err)
+ 			goto err;
+ 		old_timing = host->ios.timing;
+@@ -1303,8 +1315,81 @@ err:
+ 	return err;
+ }
+ 
++static int mmc_select_hs400es(struct mmc_card *card)
++{
++	struct mmc_host *host = card->host;
++	int err = 0;
++	u8 val;
++
++	if (!(host->caps & MMC_CAP_8_BIT_DATA)) {
++		err = -ENOTSUPP;
++		goto out_err;
++	}
++
++	err = mmc_select_bus_width(card);
++	if (IS_ERR_VALUE(err))
++		goto out_err;
++
++	/* Switch card to HS mode */
++	err = mmc_select_hs(card);
++	if (err) {
++		pr_err("%s: switch to high-speed failed, err:%d\n",
++			mmc_hostname(host), err);
++		goto out_err;
++	}
++
++	err = mmc_switch_status(card);
++	if (err)
++		goto out_err;
++
++	/* Switch card to DDR with strobe bit */
++	val = EXT_CSD_DDR_BUS_WIDTH_8 | EXT_CSD_BUS_WIDTH_STROBE;
++
++	err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
++			 EXT_CSD_BUS_WIDTH,
++			 val,
++			 card->ext_csd.generic_cmd6_time);
++	if (err) {
++		pr_err("%s: switch to bus width for hs400es failed, err:%d\n",
++			mmc_hostname(host), err);
++		goto out_err;
++	}
++
++	/* Switch card to HS400 */
++	val = EXT_CSD_TIMING_HS400 |
++	      card->drive_strength << EXT_CSD_DRV_STR_SHIFT;
++	err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
++			   EXT_CSD_HS_TIMING, val,
++			   card->ext_csd.generic_cmd6_time,
++			   true, false, true);
++	if (err) {
++		pr_err("%s: switch to hs400es failed, err:%d\n",
++			 mmc_hostname(host), err);
++		goto out_err;
++	}
++
++	/* Set host controller to HS400 timing and frequency */
++	mmc_set_timing(host, MMC_TIMING_MMC_HS400);
++
++	/* Controller enable enhanced strobe function */
++	host->ios.enhanced_strobe = true;
++	if (host->ops->hs400_enhanced_strobe)
++		host->ops->hs400_enhanced_strobe(host, &host->ios);
++
++	err = mmc_switch_status(card);
++	if (err)
++		goto out_err;
++
++	return 0;
++
++out_err:
++	pr_err("%s: %s failed, error %d\n", mmc_hostname(card->host),
++	       __func__, err);
++	return err;
++}
++
+ /*
+- * Activate High Speed or HS200 mode if supported.
++ * Activate High Speed or HS200 or HS400ES mode if supported.
+  */
+ static int mmc_select_timing(struct mmc_card *card)
+ {
+@@ -1313,7 +1398,9 @@ static int mmc_select_timing(struct mmc_card *card)
+ 	if (!mmc_can_ext_csd(card))
+ 		goto bus_speed;
+ 
+-	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS200)
++	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400ES)
++		err = mmc_select_hs400es(card);
++	else if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS200)
+ 		err = mmc_select_hs200(card);
+ 	else if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS)
+ 		err = mmc_select_hs(card);
+@@ -1581,10 +1668,10 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
+ 		err = mmc_select_hs400(card);
+ 		if (err)
+ 			goto free_card;
+-	} else {
++	} else if (mmc_card_hs(card)) {
+ 		/* Select the desired bus width optionally */
+ 		err = mmc_select_bus_width(card);
+-		if (!IS_ERR_VALUE(err) && mmc_card_hs(card)) {
++		if (!IS_ERR_VALUE(err)) {
+ 			err = mmc_select_hs_ddr(card);
+ 			if (err)
+ 				goto free_card;

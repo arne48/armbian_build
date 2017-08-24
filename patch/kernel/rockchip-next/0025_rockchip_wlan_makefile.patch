@@ -1,0 +1,30 @@
+diff --git a/drivers/net/wireless/Kconfig b/drivers/net/wireless/Kconfig
+index f9f9422..ae46ba2 100644
+--- a/drivers/net/wireless/Kconfig
++++ b/drivers/net/wireless/Kconfig
+@@ -285,5 +285,5 @@ source "drivers/net/wireless/zd1211rw/Kconfig"
+ source "drivers/net/wireless/mwifiex/Kconfig"
+ source "drivers/net/wireless/cw1200/Kconfig"
+ source "drivers/net/wireless/rsi/Kconfig"
+-
++source "drivers/net/wireless/rockchip_wlan/Kconfig"
+ endif # WLAN
+diff --git a/drivers/net/wireless/Makefile b/drivers/net/wireless/Makefile
+index 740fdd3..0a14b43 100644
+--- a/drivers/net/wireless/Makefile
++++ b/drivers/net/wireless/Makefile
+@@ -11,7 +11,7 @@ obj-$(CONFIG_AIRO)		+= airo.o
+ obj-$(CONFIG_AIRO_CS)		+= airo_cs.o airo.o
+ 
+ obj-$(CONFIG_ATMEL)             += atmel.o
+-obj-$(CONFIG_PCI_ATMEL)         += atmel_pci.o 
++obj-$(CONFIG_PCI_ATMEL)         += atmel_pci.o
+ obj-$(CONFIG_PCMCIA_ATMEL)      += atmel_cs.o
+ 
+ obj-$(CONFIG_AT76C50X_USB)      += at76c50x-usb.o
+@@ -60,3 +60,5 @@ obj-$(CONFIG_BRCMSMAC)	+= brcm80211/
+ 
+ obj-$(CONFIG_CW1200)	+= cw1200/
+ obj-$(CONFIG_RSI_91X)	+= rsi/
++
++obj-$(CONFIG_WL_ROCKCHIP)	+= rockchip_wlan/

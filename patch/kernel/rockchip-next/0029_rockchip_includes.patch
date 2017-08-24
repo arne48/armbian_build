@@ -1,0 +1,2210 @@
+diff --git a/include/linux/rockchip/common.h b/include/linux/rockchip/common.h
+new file mode 100644
+index 0000000..006d52d
+--- /dev/null
++++ b/include/linux/rockchip/common.h
+@@ -0,0 +1,100 @@
++#ifndef __MACH_ROCKCHIP_COMMON_H
++#define __MACH_ROCKCHIP_COMMON_H
++
++#include <linux/notifier.h>
++
++#define RK_DEVICE(VIRT, PHYS, SIZE) \
++	{ \
++		.virtual	= (unsigned long)(VIRT), \
++		.pfn		= __phys_to_pfn(PHYS), \
++		.length		= SIZE, \
++		.type		= MT_DEVICE, \
++	}
++
++extern bool rockchip_jtag_enabled;
++extern unsigned long rockchip_boot_fn;
++extern struct smp_operations rockchip_smp_ops;
++
++struct ddr_bw_info {
++	u32 ddr_wr;
++	u32 ddr_rd;
++	u32 ddr_act;
++	u32 ddr_time;
++	u32 ddr_total;
++	u32 ddr_percent;
++
++	u32 cpum;
++	u32 gpu;
++	u32 peri;
++	u32 video;
++	u32 vio0;
++	u32 vio1;
++	u32 vio2;
++};
++extern void (*ddr_bandwidth_get)(struct ddr_bw_info *ddr_bw_ch0,
++				 struct ddr_bw_info *ddr_bw_ch1);
++extern int (*ddr_change_freq)(uint32_t mhz);
++extern long (*ddr_round_rate)(uint32_t mhz);
++extern void (*ddr_set_auto_self_refresh)(bool en);
++extern int (*ddr_recalc_rate)(void);
++
++int rockchip_cpu_kill(unsigned int cpu);
++void rockchip_cpu_die(unsigned int cpu);
++int rockchip_cpu_disable(unsigned int cpu);
++
++#define BOOT_MODE_NORMAL		0
++#define BOOT_MODE_FACTORY2		1
++#define BOOT_MODE_RECOVERY		2
++#define BOOT_MODE_CHARGE		3
++#define BOOT_MODE_POWER_TEST		4
++#define BOOT_MODE_OFFMODE_CHARGING	5
++#define BOOT_MODE_REBOOT		6
++#define BOOT_MODE_PANIC			7
++#define BOOT_MODE_WATCHDOG		8
++#define BOOT_MODE_TSADC			9
++
++int rockchip_boot_mode(void);
++void __init rockchip_boot_mode_init(u32 flag, u32 mode);
++void rockchip_restart_get_boot_mode(const char *cmd, u32 *flag, u32 *mode);
++void __init rockchip_efuse_init(void);
++void __init rockchip_suspend_init(void);
++void __init rockchip_ion_reserve(void);
++void __init rockchip_uboot_mem_reserve(void);
++
++enum rockchip_pm_policy {
++	ROCKCHIP_PM_POLICY_PERFORMANCE = 0,
++	ROCKCHIP_PM_POLICY_NORMAL,
++	ROCKCHIP_PM_POLICY_POWERSAVE,
++	ROCKCHIP_PM_NR_POLICYS,
++};
++
++enum rockchip_pm_policy rockchip_pm_get_policy(void);
++int rockchip_pm_set_policy(enum rockchip_pm_policy policy);
++int rockchip_pm_policy_register_notifier(struct notifier_block *nb);
++int rockchip_pm_policy_unregister_notifier(struct notifier_block *nb);
++
++int rockchip_register_system_status_notifier(struct notifier_block *nb);
++int rockchip_unregister_system_status_notifier(struct notifier_block *nb);
++int rockchip_set_system_status(unsigned long status);
++int rockchip_clear_system_status(unsigned long status);
++unsigned long rockchip_get_system_status(void);
++u32 pvtm_get_value(u32 ch, u32 time_us);
++
++#define INVALID_TEMP INT_MAX
++#if IS_ENABLED(CONFIG_ROCKCHIP_THERMAL)
++int rockchip_tsadc_get_temp(int chn, int voltage);
++#else
++#if IS_ENABLED(CONFIG_SENSORS_ROCKCHIP_TSADC)
++int rockchip_tsadc_get_temp(int chn);
++#else
++static inline int rockchip_tsadc_get_temp(int chn) { return INVALID_TEMP; }
++#endif
++#endif
++
++#ifdef CONFIG_RK_LAST_LOG
++void rk_last_log_text(char *text, size_t size);
++#else
++static inline void rk_last_log_text(char *text, size_t size) {}
++#endif
++
++#endif
+diff --git a/include/linux/rockchip/cpu.h b/include/linux/rockchip/cpu.h
+new file mode 100644
+index 0000000..edc1455
+--- /dev/null
++++ b/include/linux/rockchip/cpu.h
+@@ -0,0 +1,115 @@
++#ifndef __MACH_ROCKCHIP_CPU_H
++#define __MACH_ROCKCHIP_CPU_H
++
++extern unsigned long rockchip_soc_id;
++
++static inline bool cpu_is_rockchip(void)
++{
++	return rockchip_soc_id;
++}
++
++#define ROCKCHIP_CPU_VERION_MASK	0x0000f000
++#define ROCKCHIP_CPU_VERION_SHIFT	12
++
++static inline unsigned long rockchip_get_cpu_version(void)
++{
++	return (rockchip_soc_id & ROCKCHIP_CPU_VERION_MASK)
++		>> ROCKCHIP_CPU_VERION_SHIFT;
++}
++
++static inline void rockchip_set_cpu_version(unsigned long ver)
++{
++	rockchip_soc_id &= ~ROCKCHIP_CPU_VERION_MASK;
++	rockchip_soc_id |=
++		(ver << ROCKCHIP_CPU_VERION_SHIFT) & ROCKCHIP_CPU_VERION_MASK;
++}
++
++#define ROCKCHIP_CPU_MASK       0xffff0000
++#define ROCKCHIP_CPU_RK2928     0x29280000
++#define ROCKCHIP_CPU_RK3026     0x30260000
++#define ROCKCHIP_CPU_RK312X     0x31260000
++#define ROCKCHIP_CPU_RK3036     0x30360000
++#define ROCKCHIP_CPU_RK30XX     0x30660000
++#define ROCKCHIP_CPU_RK3066B    0x31680000
++#define ROCKCHIP_CPU_RK3188     0x31880000
++#define ROCKCHIP_CPU_RK319X     0x31900000
++#define ROCKCHIP_CPU_RK3288     0x32880000
++#define ROCKCHIP_CPU_RK3228     0x32280000
++
++#ifdef CONFIG_ARM
++#define ROCKCHIP_CPU(id, ID) \
++static inline bool cpu_is_rk##id(void) \
++{ \
++	return (rockchip_soc_id & ROCKCHIP_CPU_MASK) == ROCKCHIP_CPU_RK ##ID; \
++}
++#else
++#define ROCKCHIP_CPU(id, ID) \
++static inline bool cpu_is_rk##id(void) { return false; }
++#endif
++
++ROCKCHIP_CPU(2928, 2928)
++ROCKCHIP_CPU(3026, 3026)
++ROCKCHIP_CPU(3036, 3036)
++ROCKCHIP_CPU(30xx, 30XX)
++ROCKCHIP_CPU(3066b, 3066B)
++ROCKCHIP_CPU(312x, 312X)
++ROCKCHIP_CPU(3188, 3188)
++ROCKCHIP_CPU(319x, 319X)
++ROCKCHIP_CPU(3288, 3288)
++ROCKCHIP_CPU(3228, 3228)
++
++#define ROCKCHIP_SOC_MASK	(ROCKCHIP_CPU_MASK | 0xff)
++#define ROCKCHIP_SOC_RK2926     (ROCKCHIP_CPU_RK2928 | 0x00)
++#define ROCKCHIP_SOC_RK2928G    (ROCKCHIP_CPU_RK2928 | 0x01)
++#define ROCKCHIP_SOC_RK2928L    (ROCKCHIP_CPU_RK2928 | 0x02)
++#define ROCKCHIP_SOC_RK3028A    (ROCKCHIP_CPU_RK3026 | 0x03)
++#define ROCKCHIP_SOC_RK3026     (ROCKCHIP_CPU_RK3026 | 0x04)
++#define ROCKCHIP_SOC_RK3126     (ROCKCHIP_CPU_RK312X | 0x00)
++#define ROCKCHIP_SOC_RK3126B    (ROCKCHIP_CPU_RK312X | 0x10)
++#define ROCKCHIP_SOC_RK3128     (ROCKCHIP_CPU_RK312X | 0x01)
++#define ROCKCHIP_SOC_RK3036     (ROCKCHIP_CPU_RK3036 | 0x00)
++#define ROCKCHIP_SOC_RK3000     (ROCKCHIP_CPU_RK30XX | 0x00)
++#define ROCKCHIP_SOC_RK3066     (ROCKCHIP_CPU_RK30XX | 0x01)
++#define ROCKCHIP_SOC_RK3068     (ROCKCHIP_CPU_RK30XX | 0x02)
++#define ROCKCHIP_SOC_RK3066B    (ROCKCHIP_CPU_RK3066B| 0x00)
++#define ROCKCHIP_SOC_RK3168     (ROCKCHIP_CPU_RK3066B| 0x01)
++#define ROCKCHIP_SOC_RK3028     (ROCKCHIP_CPU_RK3066B| 0x03)
++#define ROCKCHIP_SOC_RK3188     (ROCKCHIP_CPU_RK3188 | 0x00)
++#define ROCKCHIP_SOC_RK3188PLUS (ROCKCHIP_CPU_RK3188 | 0x10)
++#define ROCKCHIP_SOC_RK3190     (ROCKCHIP_CPU_RK319X | 0x00)
++#define ROCKCHIP_SOC_RK3288     (ROCKCHIP_CPU_RK3288 | 0x00)
++#define ROCKCHIP_SOC_RK3228     (ROCKCHIP_CPU_RK3228 | 0x00)
++
++#ifdef CONFIG_ARM
++#define ROCKCHIP_SOC(id, ID) \
++static inline bool soc_is_rk##id(void) \
++{ \
++	return (rockchip_soc_id & ROCKCHIP_SOC_MASK) == ROCKCHIP_SOC_RK ##ID; \
++}
++#else
++#define ROCKCHIP_SOC(id, ID) \
++static inline bool soc_is_rk##id(void) { return false; }
++#endif
++
++ROCKCHIP_SOC(2926, 2926)
++ROCKCHIP_SOC(2928g, 2928G)
++ROCKCHIP_SOC(2928l, 2928L)
++ROCKCHIP_SOC(3028a, 3028A)
++ROCKCHIP_SOC(3026, 3026)
++ROCKCHIP_SOC(3126, 3126)
++ROCKCHIP_SOC(3126b, 3126B)
++ROCKCHIP_SOC(3128, 3128)
++ROCKCHIP_SOC(3036, 3036)
++ROCKCHIP_SOC(3000, 3000)
++ROCKCHIP_SOC(3066, 3066)
++ROCKCHIP_SOC(3068, 3068)
++ROCKCHIP_SOC(3066b, 3066B)
++ROCKCHIP_SOC(3168, 3168)
++ROCKCHIP_SOC(3028, 3028)
++ROCKCHIP_SOC(3188, 3188)
++ROCKCHIP_SOC(3188plus, 3188PLUS)
++ROCKCHIP_SOC(3190, 3190)
++ROCKCHIP_SOC(3288, 3288)
++ROCKCHIP_SOC(3228, 3228)
++
++#endif
+diff --git a/include/linux/rockchip/cpu_axi.h b/include/linux/rockchip/cpu_axi.h
+new file mode 100644
+index 0000000..9af5a7a
+--- /dev/null
++++ b/include/linux/rockchip/cpu_axi.h
+@@ -0,0 +1,128 @@
++#ifndef __CPU_AXI_H
++#define __CPU_AXI_H
++
++#define CPU_AXI_QOS_PRIORITY    0x08
++#define CPU_AXI_QOS_MODE        0x0c
++#define CPU_AXI_QOS_BANDWIDTH   0x10
++#define CPU_AXI_QOS_SATURATION  0x14
++#define CPU_AXI_QOS_EXTCONTROL  0x18
++
++#define CPU_AXI_QOS_MODE_NONE           0
++#define CPU_AXI_QOS_MODE_FIXED          1
++#define CPU_AXI_QOS_MODE_LIMITER        2
++#define CPU_AXI_QOS_MODE_REGULATOR      3
++
++#define CPU_AXI_QOS_PRIORITY_LEVEL(h, l) \
++	((((h) & 3) << 8) | (((h) & 3) << 2) | ((l) & 3))
++#define CPU_AXI_SET_QOS_PRIORITY(h, l, base) \
++	writel_relaxed(CPU_AXI_QOS_PRIORITY_LEVEL(h, l), base + CPU_AXI_QOS_PRIORITY)
++
++#define CPU_AXI_SET_QOS_MODE(mode, base) \
++	writel_relaxed((mode) & 3, base + CPU_AXI_QOS_MODE)
++
++#define CPU_AXI_SET_QOS_BANDWIDTH(bandwidth, base) \
++	writel_relaxed((bandwidth) & 0x7ff, base + CPU_AXI_QOS_BANDWIDTH)
++
++#define CPU_AXI_SET_QOS_SATURATION(saturation, base) \
++	writel_relaxed((saturation) & 0x3ff, base + CPU_AXI_QOS_SATURATION)
++
++#define CPU_AXI_SET_QOS_EXTCONTROL(extcontrol, base) \
++	writel_relaxed((extcontrol) & 7, base + CPU_AXI_QOS_EXTCONTROL)
++
++#define CPU_AXI_QOS_NUM_REGS 5
++#define CPU_AXI_SAVE_QOS(array, base) do { \
++	array[0] = readl_relaxed(base + CPU_AXI_QOS_PRIORITY); \
++	array[1] = readl_relaxed(base + CPU_AXI_QOS_MODE); \
++	array[2] = readl_relaxed(base + CPU_AXI_QOS_BANDWIDTH); \
++	array[3] = readl_relaxed(base + CPU_AXI_QOS_SATURATION); \
++	array[4] = readl_relaxed(base + CPU_AXI_QOS_EXTCONTROL); \
++} while (0)
++#define CPU_AXI_RESTORE_QOS(array, base) do { \
++	writel_relaxed(array[0], base + CPU_AXI_QOS_PRIORITY); \
++	writel_relaxed(array[1], base + CPU_AXI_QOS_MODE); \
++	writel_relaxed(array[2], base + CPU_AXI_QOS_BANDWIDTH); \
++	writel_relaxed(array[3], base + CPU_AXI_QOS_SATURATION); \
++	writel_relaxed(array[4], base + CPU_AXI_QOS_EXTCONTROL); \
++} while (0)
++
++#define RK3188_CPU_AXI_DMAC_QOS_VIRT    (RK_CPU_AXI_BUS_VIRT + 0x1000)
++#define RK3188_CPU_AXI_CPU0_QOS_VIRT    (RK_CPU_AXI_BUS_VIRT + 0x2000)
++#define RK3188_CPU_AXI_CPU1R_QOS_VIRT   (RK_CPU_AXI_BUS_VIRT + 0x2080)
++#define RK3188_CPU_AXI_CPU1W_QOS_VIRT   (RK_CPU_AXI_BUS_VIRT + 0x2100)
++#define RK3188_CPU_AXI_PERI_QOS_VIRT    (RK_CPU_AXI_BUS_VIRT + 0x4000)
++#define RK3188_CPU_AXI_GPU_QOS_VIRT     (RK_CPU_AXI_BUS_VIRT + 0x5000)
++#define RK3188_CPU_AXI_VPU_QOS_VIRT     (RK_CPU_AXI_BUS_VIRT + 0x6000)
++#define RK3188_CPU_AXI_LCDC0_QOS_VIRT   (RK_CPU_AXI_BUS_VIRT + 0x7000)
++#define RK3188_CPU_AXI_CIF0_QOS_VIRT    (RK_CPU_AXI_BUS_VIRT + 0x7080)
++#define RK3188_CPU_AXI_IPP_QOS_VIRT     (RK_CPU_AXI_BUS_VIRT + 0x7100)
++#define RK3188_CPU_AXI_LCDC1_QOS_VIRT   (RK_CPU_AXI_BUS_VIRT + 0x7180)
++#define RK3188_CPU_AXI_CIF1_QOS_VIRT    (RK_CPU_AXI_BUS_VIRT + 0x7200)
++#define RK3188_CPU_AXI_RGA_QOS_VIRT     (RK_CPU_AXI_BUS_VIRT + 0x7280)
++
++/* service core */
++#define RK3288_SERVICE_CORE_VIRT                RK_CPU_AXI_BUS_VIRT
++#define RK3288_CPU_AXI_CPUM_R_QOS_VIRT          (RK3288_SERVICE_CORE_VIRT + 0x80)
++#define RK3288_CPU_AXI_CPUM_W_QOS_VIRT          (RK3288_SERVICE_CORE_VIRT + 0x100)
++#define RK3288_CPU_AXI_CPUP_QOS_VIRT            (RK3288_SERVICE_CORE_VIRT + 0x0)
++/* service dmac */
++#define RK3288_SERVICE_DMAC_VIRT                (RK3288_SERVICE_CORE_VIRT + RK3288_SERVICE_CORE_SIZE)
++#define RK3288_CPU_AXI_BUS_DMAC_QOS_VIRT        (RK3288_SERVICE_DMAC_VIRT + 0x0)
++#define RK3288_CPU_AXI_CCP_QOS_VIRT             (RK3288_SERVICE_DMAC_VIRT + 0x180)
++#define RK3288_CPU_AXI_CRYPTO_QOS_VIRT          (RK3288_SERVICE_DMAC_VIRT + 0x100)
++#define RK3288_CPU_AXI_CCS_QOS_VIRT             (RK3288_SERVICE_DMAC_VIRT + 0x200)
++#define RK3288_CPU_AXI_HOST_QOS_VIRT            (RK3288_SERVICE_DMAC_VIRT + 0x80)
++/* service gpu */
++#define RK3288_SERVICE_GPU_VIRT                 (RK3288_SERVICE_DMAC_VIRT + RK3288_SERVICE_DMAC_SIZE)
++#define RK3288_CPU_AXI_GPU_R_QOS_VIRT           (RK3288_SERVICE_GPU_VIRT + 0x0)
++#define RK3288_CPU_AXI_GPU_W_QOS_VIRT           (RK3288_SERVICE_GPU_VIRT + 0x80)
++/* service peri */
++#define RK3288_SERVICE_PERI_VIRT                (RK3288_SERVICE_GPU_VIRT + RK3288_SERVICE_GPU_SIZE)
++#define RK3288_CPU_AXI_PERI_QOS_VIRT            (RK3288_SERVICE_PERI_VIRT + 0x0)
++/* service bus */
++#define RK3288_SERVICE_BUS_VIRT                 (RK3288_SERVICE_PERI_VIRT + RK3288_SERVICE_PERI_SIZE)
++/* service vio */
++#define RK3288_SERVICE_VIO_VIRT                 (RK3288_SERVICE_BUS_VIRT + RK3288_SERVICE_BUS_SIZE)
++#define RK3288_CPU_AXI_VIO0_IEP_QOS_VIRT        (RK3288_SERVICE_VIO_VIRT + 0x500)
++#define RK3288_CPU_AXI_VIO0_VIP_QOS_VIRT        (RK3288_SERVICE_VIO_VIRT + 0x480)
++#define RK3288_CPU_AXI_VIO0_VOP_QOS_VIRT        (RK3288_SERVICE_VIO_VIRT + 0x400)
++#define RK3288_CPU_AXI_VIO1_ISP_R_QOS_VIRT      (RK3288_SERVICE_VIO_VIRT + 0x900)
++#define RK3288_CPU_AXI_VIO1_ISP_W0_QOS_VIRT     (RK3288_SERVICE_VIO_VIRT + 0x100)
++#define RK3288_CPU_AXI_VIO1_ISP_W1_QOS_VIRT     (RK3288_SERVICE_VIO_VIRT + 0x180)
++#define RK3288_CPU_AXI_VIO1_VOP_QOS_VIRT        (RK3288_SERVICE_VIO_VIRT + 0x0)
++#define RK3288_CPU_AXI_VIO2_RGA_R_QOS_VIRT      (RK3288_SERVICE_VIO_VIRT + 0x800)
++#define RK3288_CPU_AXI_VIO2_RGA_W_QOS_VIRT      (RK3288_SERVICE_VIO_VIRT + 0x880)
++/* service video */
++#define RK3288_SERVICE_VIDEO_VIRT               (RK3288_SERVICE_VIO_VIRT + RK3288_SERVICE_VIO_SIZE)
++#define RK3288_CPU_AXI_VIDEO_QOS_VIRT           (RK3288_SERVICE_VIDEO_VIRT + 0x0)
++/* service hevc */
++#define RK3288_SERVICE_HEVC_VIRT                (RK3288_SERVICE_VIDEO_VIRT + RK3288_SERVICE_VIDEO_SIZE)
++#define RK3288_CPU_AXI_HEVC_R_QOS_VIRT          (RK3288_SERVICE_HEVC_VIRT + 0x0)
++#define RK3288_CPU_AXI_HEVC_W_QOS_VIRT          (RK3288_SERVICE_HEVC_VIRT + 0x100)
++
++#define RK312X_CPU_AXI_QOS_NUM_REGS 4
++#define RK312X_CPU_AXI_SAVE_QOS(array, base) do { \
++	array[0] = readl_relaxed(base + CPU_AXI_QOS_PRIORITY); \
++	array[1] = readl_relaxed(base + CPU_AXI_QOS_MODE); \
++	array[2] = readl_relaxed(base + CPU_AXI_QOS_BANDWIDTH); \
++	array[3] = readl_relaxed(base + CPU_AXI_QOS_SATURATION); \
++} while (0)
++#define RK312X_CPU_AXI_RESTORE_QOS(array, base) do { \
++	writel_relaxed(array[0], base + CPU_AXI_QOS_PRIORITY); \
++	writel_relaxed(array[1], base + CPU_AXI_QOS_MODE); \
++	writel_relaxed(array[2], base + CPU_AXI_QOS_BANDWIDTH); \
++	writel_relaxed(array[3], base + CPU_AXI_QOS_SATURATION); \
++} while (0)
++#define RK312X_SERVICE_VIO_VIRT                 (RK_CPU_AXI_BUS_VIRT + 0x7000)
++
++#define RK312X_CPU_AXI_VIO_RGA_QOS_VIRT        (RK312X_SERVICE_VIO_VIRT)
++#define RK312X_CPU_AXI_VIO_EBC_QOS_VIRT        (RK312X_SERVICE_VIO_VIRT + 0x80)
++#define RK312X_CPU_AXI_VIO_IEP_QOS_VIRT      (RK312X_SERVICE_VIO_VIRT + 0x100)
++#define RK312X_CPU_AXI_VIO_LCDC0_QOS_VIRT     (RK312X_SERVICE_VIO_VIRT + 0x180)
++#define RK312X_CPU_AXI_VIO_VIP0_QOS_VIRT     (RK312X_SERVICE_VIO_VIRT + 0x200)
++
++#define RK312X_SERVICE_GPU_VIRT                 (RK_CPU_AXI_BUS_VIRT + 0x5000)
++#define RK312X_CPU_AXI_GPU_QOS_VIRT        (RK312X_SERVICE_GPU_VIRT)
++
++#define RK312X_SERVICE_VIDEO_VIRT                 (RK_CPU_AXI_BUS_VIRT + 0x6000)
++#define RK312X_CPU_AXI_VIDEO_QOS_VIRT        (RK312X_SERVICE_VIDEO_VIRT)
++#endif
+diff --git a/include/linux/rockchip/cru.h b/include/linux/rockchip/cru.h
+new file mode 100755
+index 0000000..ee33f5a
+--- /dev/null
++++ b/include/linux/rockchip/cru.h
+@@ -0,0 +1,281 @@
++#ifndef __MACH_ROCKCHIP_CRU_H
++#define __MACH_ROCKCHIP_CRU_H
++
++#include <dt-bindings/clock/rockchip,rk3188.h>
++#include <dt-bindings/clock/rockchip,rk3288.h>
++#include <linux/rockchip/iomap.h>
++
++
++/*******************CRU BITS*******************************/
++
++#define CRU_W_MSK(bits_shift, msk)	((msk) << ((bits_shift) + 16))
++
++#define CRU_SET_BITS(val, bits_shift, msk)	(((val)&(msk)) << (bits_shift))
++
++#define CRU_W_MSK_SETBITS(val, bits_shift,msk) \
++	(CRU_W_MSK(bits_shift, msk) | CRU_SET_BITS(val, bits_shift, msk))
++
++/*******************RK3188********************************/
++/*******************CRU OFFSET*********************/
++#define RK3188_CRU_MODE_CON		0x40
++#define RK3188_CRU_CLKSEL_CON		0x44
++#define RK3188_CRU_CLKGATE_CON		0xd0
++#define RK3188_CRU_GLB_SRST_FST		0x100
++#define RK3188_CRU_GLB_SRST_SND		0x104
++#define RK3188_CRU_SOFTRST_CON		0x110
++
++#define RK3188_PLL_CONS(id, i)		((id) * 0x10 + ((i) * 4))
++
++#define RK3188_CRU_CLKSELS_CON_CNT	(35)
++#define RK3188_CRU_CLKSELS_CON(i)	(RK3188_CRU_CLKSEL_CON + ((i) * 4))
++
++#define RK3188_CRU_CLKGATES_CON_CNT	(10)
++#define RK3188_CRU_CLKGATES_CON(i)	(RK3188_CRU_CLKGATE_CON + ((i) * 4))
++
++#define RK3188_CRU_SOFTRSTS_CON_CNT	(9)
++#define RK3188_CRU_SOFTRSTS_CON(i)	(RK3188_CRU_SOFTRST_CON + ((i) * 4))
++
++#define RK3188_CRU_MISC_CON		(0x134)
++#define RK3188_CRU_GLB_CNT_TH		(0x140)
++
++/******************PLL MODE BITS*******************/
++#define RK3188_PLL_MODE_MSK(id)		(0x3 << ((id) * 4))
++#define RK3188_PLL_MODE_SLOW(id)	((0x0<<((id)*4))|(0x3<<(16+(id)*4)))
++#define RK3188_PLL_MODE_NORM(id)	((0x1<<((id)*4))|(0x3<<(16+(id)*4)))
++#define RK3188_PLL_MODE_DEEP(id)	((0x2<<((id)*4))|(0x3<<(16+(id)*4)))
++
++/******************CRU GATINGS**********************************/
++#define RK3188_CRU_GATEID_CONS(ID) (RK3188_CRU_CLKGATE_CON+(ID/16)*4)
++
++/*************************RK3288********************************/
++
++/*******************CRU OFFSET*********************/
++#define RK3288_CRU_MODE_CON		0x50
++#define RK3288_CRU_CLKSEL_CON		0x60
++#define RK3288_CRU_CLKGATE_CON		0x160
++
++#define RK3288_PLL_CONS(id, i)		((id) * 0x10 + ((i) * 4))
++#define RK3288_CRU_CLKSELS_CON(i)	(RK3288_CRU_CLKSEL_CON + ((i) * 4))
++#define RK3288_CRU_CLKGATES_CON(i)	(RK3288_CRU_CLKGATE_CON + ((i) * 4))
++
++/******************PLL MODE BITS*******************/
++/*************apll dpll,cpll,gpll,npll 0~4************/
++#define RK3288_PLLS_MODE_OFFSET(id) ((id)<=3 ? (id*4) : 14)
++#define RK3288_PLL_MODE_MSK(id)		(0x3 << RK3288_PLLS_MODE_OFFSET(id))
++#define RK3288_PLL_MODE_SLOW(id)	((0x0<<RK3288_PLLS_MODE_OFFSET(id))|(0x3<<(16+RK3288_PLLS_MODE_OFFSET(id))))
++#define RK3288_PLL_MODE_NORM(id)	((0x1<<RK3288_PLLS_MODE_OFFSET(id))|(0x3<<(16+RK3288_PLLS_MODE_OFFSET(id))))
++#define RK3288_PLL_MODE_DEEP(id)	((0x2<<RK3288_PLLS_MODE_OFFSET(id))|(0x3<<(16+RK3288_PLLS_MODE_OFFSET(id))))
++
++/*******************CRU GATING*********************/
++#define RK3288_CRU_CLKGATES_CON_CNT (19)
++#define RK3288_CRU_CONS_GATEID(i)	(16 * (i))
++#define RK3288_CRU_GATEID_CONS(ID)	(RK3288_CRU_CLKGATE_CON+(ID/16)*4)
++
++enum rk3288_cru_clk_gate {
++	/* SCU CLK GATE 0 CON */
++	RK3288_CLKGATE_UART0_SRC    =   (RK3288_CRU_CONS_GATEID(1)+8),   
++	
++	RK3288_CLKGATE_UART4_SRC    =   (RK3288_CRU_CONS_GATEID(2)+12),   
++	
++        RK3288_CLKGATE_PCLK_UART0= (RK3288_CRU_CONS_GATEID(6)+8),   
++        RK3288_CLKGATE_PCLK_UART1,
++        RK3288_CLKGATE6_DUMP1,
++        RK3288_CLKGATE_PCLK_UART3,
++        RK3288_CLKGATE_PCLK_I2C2,
++        RK3288_CLKGATE_PCLK_I2C3,
++        RK3288_CLKGATE_PCLK_I2C4,
++
++    	RK3288_CLKGATE_PCLK_I2C0    =   (RK3288_CRU_CONS_GATEID(10)+2),	
++	RK3288_CLKGATE_PCLK_I2C1,
++	
++        RK3288_CLKGATE_PCLK_UART2    =   (RK3288_CRU_CONS_GATEID(11)+9), 
++
++    
++	RK3288_CLKGATE_PCLK_GPIO1   =   (RK3288_CRU_CONS_GATEID(14)+1),
++	
++	RK3288_CLKGATE_PCLK_GPIO0   =   (RK3288_CRU_CONS_GATEID(17)+4),
++        //gate6
++};
++
++#define RK3288_CRU_GLB_SRST_FST_VALUE   0x1b0
++#define RK3288_CRU_GLB_SRST_SND_VALUE   0x1b4
++#define RK3288_CRU_SOFTRST_CON          0x1b8
++#define RK3288_CRU_MISC_CON             0x1e8
++#define RK3288_CRU_GLB_CNT_TH           0x1ec
++#define RK3288_CRU_GLB_RST_CON          0x1f0
++#define RK3288_CRU_GLB_RST_ST           0x1f8
++#define RK3288_CRU_SDMMC_CON0           0x200
++#define RK3288_CRU_SDMMC_CON1           0x204
++#define RK3288_CRU_SDIO0_CON0           0x208
++#define RK3288_CRU_SDIO0_CON1           0x20c
++#define RK3288_CRU_SDIO1_CON0           0x210
++#define RK3288_CRU_SDIO1_CON1           0x214
++#define RK3288_CRU_EMMC_CON0            0x218
++#define RK3288_CRU_EMMC_CON1            0x21c
++
++#define RK3288_CRU_SOFTRSTS_CON_CNT	(12)
++#define RK3288_CRU_SOFTRSTS_CON(i)	(RK3288_CRU_SOFTRST_CON + ((i) * 4))
++
++static inline void rk3288_cru_set_soft_reset(u32 idx, bool on)
++{
++	void __iomem *reg = RK_CRU_VIRT + RK3288_CRU_SOFTRSTS_CON(idx >> 4);
++	u32 val = on ? 0x10001U << (idx & 0xf) : 0x10000U << (idx & 0xf);
++	writel_relaxed(val, reg);
++	dsb(sy);
++}
++
++#define RK3036_CRU_MODE_CON 0x0040
++
++/******************PLL MODE BITS*******************/
++/****************apll dpll,gpll 0~2******************/
++#define RK3036_PLLS_MODE_OFFSET(id) ((id) < 2 ? (id*4) : 12)
++
++#define RK3036_PLL_MODE_SLOW(id)	((0x0 << RK3036_PLLS_MODE_OFFSET(id)) \
++	| (((id) < 2 ? 0x1 : 0x3) << (16 + RK3036_PLLS_MODE_OFFSET(id))))
++
++#define RK3036_PLL_MODE_MSK(id)	(0x1 << RK3036_PLLS_MODE_OFFSET(id))
++
++#define RK3036_APLL_MODE_SLOW	((0x0<<0x00)|(0x1<<(16+0x00)))
++#define RK3036_DPLL_MODE_SLOW	((0x0<<0x04)|(0x1<<(16+0x04)))
++#define RK3036_GPLL_MODE_SLOW	((0x0<<0x12)|(0x3<<(16+0x12)))
++
++#define RK3036_APLL_MODE_NORM	((0x1<<0x00)|(0x1<<(16+0x00)))
++#define RK3036_DPLL_MODE_NORM	((0x1<<0x04)|(0x1<<(16+0x04)))
++#define RK3036_GPLL_MODE_NORM	((0x1<<0x12)|(0x3<<(16+0x12)))
++
++#define RK3036_GPLL_MODE_DEEP	((0x10<<0x12)|(0x3<<(16+0x12)))
++
++#define RK3036_PLL_CONS(id, i)	(((id) < 2 ? id : (id + 1)) * 0x10 + ((i) * 4))
++
++#define RK3036_CRU_GLB_SRST_FST_VALUE 0x00100
++#define RK3036_CRU_GLB_SRST_SND_VALUE 0x00104
++#define RK3036_CRU_SOFTRST0_CON 0x00110
++#define RK3036_CRU_SOFTRST1_CON 0x00114
++#define RK3036_CRU_SOFTRST2_CON 0x00118
++#define RK3036_CRU_SOFTRST3_CON 0x0011c
++#define RK3036_CRU_SOFTRST4_CON 0x00120
++#define RK3036_CRU_SOFTRST5_CON 0x00124
++#define RK3036_CRU_SOFTRST6_CON 0x00128
++#define RK3036_CRU_SOFTRST7_CON 0x0012c
++#define RK3036_CRU_SOFTRST8_CON 0x00130
++#define RK3036_CRU_MISC_CON 0x00134
++#define RK3036_CRU_GLB_CNT_TH 0x00140
++#define RK3036_CRU_SDMMC_CON0 0x00144
++#define RK3036_CRU_SDMMC_CON1 0x00148
++#define RK3036_CRU_SDIO_CON0 0x0014c
++#define RK3036_CRU_SDIO_CON1 0x00150
++#define RK3036_CRU_EMMC_CON0 0x00154
++#define RK3036_CRU_EMMC_CON1 0x00158
++#define RK3036_CRU_RST_ST 0x00160
++#define RK3036_CRU_PLL_MASK_CON 0x001f0
++
++#define RK3036_CRU_CLKSEL_CON		0x44
++#define RK3036_CRU_CLKGATE_CON		0xd0
++
++#define RK3036_CRU_CLKSELS_CON_CNT	(35)
++#define RK3036_CRU_CLKSELS_CON(i)	(RK3036_CRU_CLKSEL_CON + ((i) * 4))
++
++#define RK3036_CRU_CLKGATES_CON_CNT	(11)
++#define RK3036_CRU_CLKGATES_CON(i)	(RK3036_CRU_CLKGATE_CON + ((i) * 4))
++
++#define RK3036_CRU_SOFTRSTS_CON_CNT	(9)
++#define RK3036_CRU_SOFTRSTS_CON(i)	(RK3036_CRU_SOFTRST_CON + ((i) * 4))
++
++/*******************CRU GATING*********************/
++#define RK3036_CRU_UART_GATE                0xd4
++#define RK3036_CLKGATE_UART0_SRC        8
++#define RK3036_CLKGATE_UART0_PCLK      9
++
++#define RK312X_PLL_CONS(id, i)		((id) * 0x10 + ((i) * 4))
++
++#define RK312X_CRU_GLB_SRST_FST_VALUE 0x00100
++#define RK312X_CRU_GLB_SRST_SND_VALUE 0x00104
++#define RK312X_CRU_MISC_CON 0x00134
++#define RK312X_CRU_GLB_CNT_TH 0x00140
++#define RK312X_CRU_GLB_RST_ST 0x00150
++#define RK312X_CRU_SDMMC_CON0	0x01c0
++#define RK312X_CRU_SDMMC_CON1	0x01c4
++#define RK312X_CRU_SDIO_CON0	0x01c8
++#define RK312X_CRU_SDIO_CON1	0x01cc
++#define RK312X_CRU_EMMC_CON0	0x01d8
++#define RK312X_CRU_EMMC_CON1	0x01dc
++#define RK312X_CRU_PLL_PRG_EN	0x01f0
++#define RK312X_CRU_MODE_CON		0x40
++#define RK312X_CRU_RST_ST 0x00160
++#define RK312X_CRU_PLL_MASK_CON 0x001f0
++
++#define RK312X_CRU_CLKSEL_CON		0x44
++#define RK312X_CRU_CLKGATE_CON		0xd0
++
++#define RK312X_PLL_CONS(id, i)		((id) * 0x10 + ((i) * 4))
++
++/******************PLL MODE BITS*******************/
++#define RK312X_PLLS_MODE_OFFSET(id) ((id) <= 3 ? (id * 4) : 14)
++#define RK312X_PLL_MODE_MSK(id)		(0x1 << RK312X_PLLS_MODE_OFFSET(id))
++#define RK312X_PLL_MODE_SLOW(id)	((0x0 << RK312X_PLLS_MODE_OFFSET(id))\
++| (0x1 << (16 + RK312X_PLLS_MODE_OFFSET(id))))
++#define RK312X_PLL_MODE_NORM(id)	((0x1 << RK312X_PLLS_MODE_OFFSET(id))\
++| (0x1 << (16 + RK312X_PLLS_MODE_OFFSET(id))))
++
++
++#define RK312X_CRU_SOFTRST_CON		0x110
++
++#define RK312X_CRU_CLKSELS_CON_CNT	(35)
++#define RK312X_CRU_CLKSELS_CON(i)	(RK3036_CRU_CLKSEL_CON + ((i) * 4))
++
++#define RK312X_CRU_CLKGATES_CON_CNT	(11)
++#define RK312X_CRU_CLKGATES_CON(i)	(RK3036_CRU_CLKGATE_CON + ((i) * 4))
++
++#define RK312X_CRU_SOFTRSTS_CON_CNT	(9)
++#define RK312X_CRU_SOFTRSTS_CON(i)	(RK312X_CRU_SOFTRST_CON + ((i) * 4))
++
++/*******************CRU GATING*********************/
++#define RK312X_CRU_CONS_GATEID(i)	(16 * (i))
++#define RK312X_CRU_GATEID_CONS(ID)	(RK312X_CRU_CLKGATE_CON\
++	+ ((ID) / 16) * 4)
++
++enum rk312x_cru_clk_gate {
++	/* SCU CLK GATE 0 CON */
++	RK312X_CLKGATE_UART0_SRC = (RK312X_CRU_CONS_GATEID(1) + 8),
++	RK312X_CLKGATE_PCLK_UART0 = (RK312X_CRU_CONS_GATEID(8) + 0),
++	RK312X_CLKGATE_PCLK_UART1,
++	RK312X_CLKGATE_PCLK_UART2,
++};
++
++#define RK3228_PLL_CONS(id, i)		RK312X_PLL_CONS(id, i)
++#define RK3228_CRU_MODE_CON			RK312X_CRU_MODE_CON
++#define RK3228_CRU_CLKSELS_CON_CNT	RK312X_CRU_CLKSELS_CON_CNT
++#define RK3228_CRU_CLKSELS_CON(i)	RK312X_CRU_CLKSELS_CON(i)
++#define RK3228_CRU_CLKGATES_CON_CNT	(16)
++#define RK3228_CRU_CLKGATES_CON(i)	RK312X_CRU_CLKGATES_CON(i)
++#define RK3228_CRU_SOFTRSTS_CON_CNT	RK312X_CRU_SOFTRSTS_CON_CNT
++#define RK3228_CRU_SOFTRSTS_CON(i)	RK312X_CRU_SOFTRSTS_CON(i)
++#define RK3228_CRU_MISC_CON		RK312X_CRU_MISC_CON
++#define RK3228_CRU_GLB_CNT_TH		RK312X_CRU_GLB_CNT_TH
++#define RK3228_CRU_GLB_RST_ST		RK312X_CRU_GLB_RST_ST
++#define RK3228_CRU_SDMMC_CON0		RK312X_CRU_SDMMC_CON0
++#define RK3228_CRU_SDMMC_CON1		RK312X_CRU_SDMMC_CON1
++#define RK3228_CRU_SDIO_CON0		RK312X_CRU_SDIO_CON0
++#define RK3228_CRU_SDIO_CON1		RK312X_CRU_SDIO_CON1
++#define RK3228_CRU_EMMC_CON0		RK312X_CRU_EMMC_CON0
++#define RK3228_CRU_EMMC_CON1		RK312X_CRU_EMMC_CON1
++#define RK3228_CRU_GLB_SRST_FST_VALUE	0x001f0
++#define RK3228_CRU_GLB_SRST_SND_VALUE	0x001f4
++#define RK3228_CRU_PLL_MASK_CON		0x001f8
++
++/*************************RK3368********************************/
++
++/*******************CRU OFFSET*********************/
++#define RK3368_CRU_CLKSEL_CON		0x100
++#define RK3368_CRU_CLKGATE_CON		0x200
++#define RK3368_CRU_CLKGATES_CON_CNT     25
++
++#define RK3368_PLL_CONS(id, i)		((id) * 0x10 + ((i) * 4))
++#define RK3368_CRU_CLKSELS_CON(i)	(RK3368_CRU_CLKSEL_CON + ((i) * 4))
++#define RK3368_CRU_CLKGATES_CON(i)	(RK3368_CRU_CLKGATE_CON + ((i) * 4))
++
++#define RK3368_CRU_SOFTRSTS_CON_CNT	(15)
++#define RK3368_CRU_SOFTRST_CON          0x300
++#define RK3368_CRU_SOFTRSTS_CON(i)	(RK3368_CRU_SOFTRST_CON + ((i) * 4))
++
++#endif
+diff --git a/include/linux/rockchip/dvfs.h b/include/linux/rockchip/dvfs.h
+new file mode 100644
+index 0000000..1aaffbd
+--- /dev/null
++++ b/include/linux/rockchip/dvfs.h
+@@ -0,0 +1,258 @@
++/* arch/arm/mach-rk30/rk30_dvfs.h
++ *
++ * Copyright (C) 2012 ROCKCHIP, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#ifndef _RK30_DVFS_H_
++#define _RK30_DVFS_H_
++
++#include <linux/device.h>
++#include <linux/clk-provider.h>
++
++#define ARM_DVFS_CH	0
++#define GPU_DVFS_CH	1
++#define LOG_DVFS_CH	2
++
++struct dvfs_node;
++typedef int (*dvfs_set_rate_callback)(struct dvfs_node *clk_dvfs_node, unsigned long rate);
++typedef int (*clk_set_rate_callback)(struct clk *clk, unsigned long rate);
++
++/**
++ * struct vd_node:	To Store All Voltage Domains' info
++ * @name:		Voltage Domain's Name
++ * @regulator_name:	Voltage domain's regulator name
++ * @cur_volt:		Voltage Domain's Current Voltage
++ * @regulator:		Voltage Domain's regulator point
++ * @node:		Point of he Voltage Domain List Node
++ * @pd_list:		Head of Power Domain List Belongs to This Voltage Domain
++ * @req_volt_list:	The list of clocks requests
++ * @dvfs_mutex:		Lock
++ * @vd_dvfs_target:	Callback function	
++ */
++ #define VD_VOL_LIST_CNT (200)
++ #define VD_LIST_RELATION_L 0
++ #define VD_LIST_RELATION_H 1
++
++struct vd_node {
++	const char		*name;
++	const char		*regulator_name;
++	int			volt_time_flag;// =0 ,is no initing checking ,>0 ,support,<0 not support
++	int			mode_flag;// =0 ,is no initing checking ,>0 ,support,<0 not support;
++	int			cur_volt;
++	int			volt_set_flag;
++	int			suspend_volt;
++	struct regulator	*regulator;
++	struct list_head	node;
++	struct list_head	pd_list;
++	struct mutex		mutex;
++	dvfs_set_rate_callback	vd_dvfs_target;
++	unsigned int 		n_voltages;
++	int volt_list[VD_VOL_LIST_CNT];
++	unsigned int		regu_mode;
++};
++
++/**
++ * struct pd_node:	To Store All Power Domains' info
++ * @name:		Power Domain's Name
++ * @cur_volt:		Power Domain's Current Voltage
++ * @pd_status:		Power Domain's status
++ * @vd:			Voltage Domain the power domain belongs to
++ * @pd_clk:		Look power domain as a clock
++ * @node:		List node to Voltage Domain
++ * @clk_list:		Head of Power Domain's Clocks List
++ */
++struct pd_node {
++	const char		*name;
++	int			cur_volt;
++	unsigned char		pd_status;
++	struct vd_node		*vd;
++	struct list_head	node;
++	struct list_head	clk_list;
++	unsigned int		regu_mode;
++};
++
++struct pvtm_info {
++	const char *compatible;
++	struct cpufreq_frequency_table *pvtm_table;
++	int channel;
++	int process_version;
++	int scan_rate_hz;
++	int sample_time_us;
++	int volt_step_uv;
++	int delta_pvtm_by_volt;
++	int delta_pvtm_by_temp;
++	int volt_margin_uv;
++	int min_volt_uv;
++	int max_volt_uv;
++	int cluster;
++};
++
++struct lkg_adjust_volt_table {
++	int	lkg;
++	int	dlt_volt;
++};
++
++struct lkg_info {
++	int	def_table_lkg;
++	int	min_adjust_freq;
++	struct	lkg_adjust_volt_table *table;
++};
++
++/**
++ * struct dvfs_node:	To Store All dvfs clocks' info
++ * @name:		Dvfs clock's Name
++ * @set_freq:		Dvfs clock's Current Frequency
++ * @set_volt:		Dvfs clock's Current Voltage
++ * @enable_dvfs:	Sign if DVFS clock enable
++ * @clk:		System clk's point
++ * @pd:			Power Domains dvfs clock belongs to
++ * @vd:			Voltage Domains dvfs clock belongs to
++ * @dvfs_nb:		Notify list
++ * @dvfs_table:		Frequency and voltage table for dvfs
++ * @clk_dvfs_target:	Callback function
++ */
++struct dvfs_node {
++	struct device		dev;		//for opp
++	const char		*name;
++	int			set_freq;	//KHZ
++	int			set_volt;	//MV
++	int			enable_count;
++	int			freq_limit_en;	//sign if use limit frequency
++	int			support_pvtm;
++	unsigned int		min_rate;	//limit min frequency
++	unsigned int		max_rate;	//limit max frequency
++	unsigned long		last_set_rate;
++	unsigned int		channel;
++	unsigned int		temp_channel;
++	unsigned long		temp_limit_rate;
++	unsigned int        target_temp;
++	unsigned int        temp_limit_enable;
++	unsigned int	    min_temp_limit;
++	int                 old_temp;
++	struct clk 		*clk;
++	struct pd_node		*pd;
++	struct vd_node		*vd;
++	struct list_head	node;
++	struct notifier_block	*dvfs_nb;
++	struct cpufreq_frequency_table	*dvfs_table;
++	struct cpufreq_frequency_table	*pvtm_table;
++	struct cpufreq_frequency_table	*per_temp_limit_table;
++	struct cpufreq_frequency_table  *nor_temp_limit_table;
++	struct cpufreq_frequency_table  *virt_temp_limit_table[4];
++	clk_set_rate_callback 	clk_dvfs_target;
++	struct cpufreq_frequency_table  *regu_mode_table;
++	int			regu_mode_en;
++	unsigned int		regu_mode;
++	struct pvtm_info	*pvtm_info;
++	int                 lkg_adjust_volt_en;
++	struct lkg_info		lkg_info;
++	unsigned int		cluster;
++	unsigned int        max_limit_freq;
++	unsigned int        pvtm_min_temp;
++};
++
++
++
++#define DVFS_MHZ (1000*1000)
++#define DVFS_KHZ (1000)
++
++#define DVFS_V (1000*1000)
++#define DVFS_MV (1000)
++#if 0
++#define DVFS_DBG(fmt, args...) printk(KERN_INFO "DVFS DBG:\t"fmt, ##args)
++#else
++#define DVFS_DBG(fmt, args...) {while(0);}
++#endif
++
++#define DVFS_ERR(fmt, args...) printk(KERN_ERR "DVFS ERR:\t"fmt, ##args)
++#define DVFS_LOG(fmt, args...) printk(KERN_DEBUG "DVFS LOG:\t"fmt, ##args)
++#define DVFS_WARNING(fmt, args...) printk(KERN_WARNING "DVFS WARNING:\t"fmt, ##args)
++
++#define DVFS_SET_VOLT_FAILURE 	1
++#define DVFS_SET_VOLT_SUCCESS	0
++
++#define dvfs_regulator_get(dev,id) regulator_get((dev),(id))
++#define dvfs_regulator_put(regu) regulator_put((regu))
++#define dvfs_regulator_set_voltage(regu,min_uV,max_uV) regulator_set_voltage((regu),(min_uV),(max_uV))
++#define dvfs_regulator_get_voltage(regu) regulator_get_voltage((regu))
++#define dvfs_regulator_set_voltage_time(regu, old_uV, new_uV) regulator_set_voltage_time((regu), (old_uV), (new_uV))
++#define dvfs_regulator_set_mode(regu, mode) regulator_set_mode((regu), (mode))
++#define dvfs_regulator_get_mode(regu) regulator_get_mode((regu))
++#define dvfs_regulator_list_voltage(regu,selector) regulator_list_voltage((regu),(selector))
++#define dvfs_regulator_count_voltages(regu) regulator_count_voltages((regu))
++
++#define clk_dvfs_node_get(a,b) clk_get((a),(b))
++#define clk_dvfs_node_get_rate_kz(a) (clk_get_rate((a))/1000)
++#define clk_dvfs_node_set_rate(a,b) clk_set_rate((a),(b))
++
++typedef void (*avs_init_fn)(void);
++typedef u8 (*avs_get_val_fn)(void);
++struct avs_ctr_st {
++	avs_init_fn		avs_init;
++	avs_get_val_fn		avs_get_val;
++};
++
++#ifdef CONFIG_DVFS
++struct dvfs_node *clk_get_dvfs_node(char *clk_name);
++void clk_put_dvfs_node(struct dvfs_node *clk_dvfs_node);
++unsigned long dvfs_clk_get_rate(struct dvfs_node *clk_dvfs_node);
++unsigned long dvfs_clk_get_last_set_rate(struct dvfs_node *clk_dvfs_node);
++unsigned long dvfs_clk_round_rate(struct dvfs_node *clk_dvfs_node, unsigned long rate);
++int dvfs_clk_set_rate(struct dvfs_node *clk_dvfs_node, unsigned long rate);
++int dvfs_clk_enable(struct dvfs_node *clk_dvfs_node);
++void dvfs_clk_disable(struct dvfs_node *clk_dvfs_node);
++int dvfs_clk_prepare_enable(struct dvfs_node *clk_dvfs_node);
++void dvfs_clk_disable_unprepare(struct dvfs_node *clk_dvfs_node);
++int dvfs_set_freq_volt_table(struct dvfs_node *clk_dvfs_node, struct cpufreq_frequency_table *table);
++int dvfs_clk_register_set_rate_callback(struct dvfs_node *clk_dvfs_node, clk_set_rate_callback clk_dvfs_target);
++int dvfs_clk_enable_limit(struct dvfs_node *clk_dvfs_node, unsigned int min_rate, unsigned max_rate);
++int dvfs_clk_get_limit(struct dvfs_node *clk_dvfs_node, unsigned int *min_rate, unsigned int *max_rate) ;
++int dvfs_clk_disable_limit(struct dvfs_node *clk_dvfs_node);
++int clk_disable_dvfs(struct dvfs_node *clk_dvfs_node);
++int clk_enable_dvfs(struct dvfs_node *clk_dvfs_node);
++void dvfs_disable_temp_limit(void);
++struct cpufreq_frequency_table *dvfs_get_freq_volt_table(struct dvfs_node *clk_dvfs_node);
++int rk_regist_vd(struct vd_node *vd);
++int rk_regist_pd(struct pd_node *pd);
++int rk_regist_clk(struct dvfs_node *clk_dvfs_node);
++struct regulator *dvfs_get_regulator(char *regulator_name);
++int of_dvfs_init(void);
++
++#else
++
++static inline struct dvfs_node *clk_get_dvfs_node(char *clk_name){ return NULL; };
++static inline void clk_put_dvfs_node(struct dvfs_node *clk_dvfs_node){ return; };
++static inline unsigned long dvfs_clk_get_rate(struct dvfs_node *clk_dvfs_node){ return 0; };
++static inline unsigned long dvfs_clk_get_last_set_rate(struct dvfs_node *clk_dvfs_node){ return 0; };
++static inline unsigned long dvfs_clk_round_rate(struct dvfs_node *clk_dvfs_node, unsigned long rate) { return 0; };
++static inline int dvfs_clk_set_rate(struct dvfs_node *clk_dvfs_node, unsigned long rate){ return 0; };
++static inline int dvfs_clk_enable(struct dvfs_node *clk_dvfs_node){ return 0; };
++static inline void dvfs_clk_disable(struct dvfs_node *clk_dvfs_node){ };
++static inline int dvfs_clk_prepare_enable(struct dvfs_node *clk_dvfs_node){ return 0; };
++static inline void dvfs_clk_disable_unprepare(struct dvfs_node *clk_dvfs_node){ };
++static inline int dvfs_set_freq_volt_table(struct dvfs_node *clk_dvfs_node, struct cpufreq_frequency_table *table){ return 0; };
++static inline int dvfs_clk_register_set_rate_callback(struct dvfs_node *clk_dvfs_node, clk_set_rate_callback clk_dvfs_target){ return 0; };
++static inline int dvfs_clk_enable_limit(struct dvfs_node *clk_dvfs_node, unsigned int min_rate, unsigned max_rate){ return 0; };
++static inline int dvfs_clk_get_limit(struct dvfs_node *clk_dvfs_node, unsigned int *min_rate, unsigned int *max_rate) { return 0; };
++static inline int dvfs_clk_disable_limit(struct dvfs_node *clk_dvfs_node){ return 0; };
++static inline int clk_disable_dvfs(struct dvfs_node *clk_dvfs_node){ return 0; };
++static inline int clk_enable_dvfs(struct dvfs_node *clk_dvfs_node){ return 0; };
++static inline void dvfs_disable_temp_limit(void) {};
++static inline struct cpufreq_frequency_table *dvfs_get_freq_volt_table(struct dvfs_node *clk_dvfs_node){ return NULL; };
++static inline int rk_regist_vd(struct vd_node *vd){ return 0; };
++static inline int rk_regist_pd(struct pd_node *pd){ return 0; };
++static inline int rk_regist_clk(struct dvfs_node *clk_dvfs_node){ return 0; };
++static inline struct regulator *dvfs_get_regulator(char *regulator_name){ return NULL; };
++static inline int of_dvfs_init(void){ return 0; };
++#endif
++
++#endif
+diff --git a/include/linux/rockchip/grf.h b/include/linux/rockchip/grf.h
+new file mode 100755
+index 0000000..ab03372
+--- /dev/null
++++ b/include/linux/rockchip/grf.h
+@@ -0,0 +1,699 @@
++#ifndef __MACH_ROCKCHIP_GRF_H
++#define __MACH_ROCKCHIP_GRF_H
++
++#define RK3188_GRF_GPIO0L_DIR           0x0000
++#define RK3188_GRF_GPIO0H_DIR           0x0004
++#define RK3188_GRF_GPIO1L_DIR           0x0008
++#define RK3188_GRF_GPIO1H_DIR           0x000c
++#define RK3188_GRF_GPIO2L_DIR           0x0010
++#define RK3188_GRF_GPIO2H_DIR           0x0014
++#define RK3188_GRF_GPIO3L_DIR           0x0018
++#define RK3188_GRF_GPIO3H_DIR           0x001c
++#define RK3188_GRF_GPIO0L_DO            0x0020
++#define RK3188_GRF_GPIO0H_DO            0x0024
++#define RK3188_GRF_GPIO1L_DO            0x0028
++#define RK3188_GRF_GPIO1H_DO            0x002c
++#define RK3188_GRF_GPIO2L_DO            0x0030
++#define RK3188_GRF_GPIO2H_DO            0x0034
++#define RK3188_GRF_GPIO3L_DO            0x0038
++#define RK3188_GRF_GPIO3H_DO            0x003c
++#define RK3188_GRF_GPIO0L_EN            0x0040
++#define RK3188_GRF_GPIO0H_EN            0x0044
++#define RK3188_GRF_GPIO1L_EN            0x0048
++#define RK3188_GRF_GPIO1H_EN            0x004c
++#define RK3188_GRF_GPIO2L_EN            0x0050
++#define RK3188_GRF_GPIO2H_EN            0x0054
++#define RK3188_GRF_GPIO3L_EN            0x0058
++#define RK3188_GRF_GPIO3H_EN            0x005c
++
++#define RK3188_GRF_GPIO0C_IOMUX         0x0068
++#define RK3188_GRF_GPIO0D_IOMUX         0x006c
++#define RK3188_GRF_GPIO1A_IOMUX         0x0070
++#define RK3188_GRF_GPIO1B_IOMUX         0x0074
++#define RK3188_GRF_GPIO1C_IOMUX         0x0078
++#define RK3188_GRF_GPIO1D_IOMUX         0x007c
++#define RK3188_GRF_GPIO2A_IOMUX         0x0080
++#define RK3188_GRF_GPIO2B_IOMUX         0x0084
++#define RK3188_GRF_GPIO2C_IOMUX         0x0088
++#define RK3188_GRF_GPIO2D_IOMUX         0x008c
++#define RK3188_GRF_GPIO3A_IOMUX         0x0090
++#define RK3188_GRF_GPIO3B_IOMUX         0x0094
++#define RK3188_GRF_GPIO3C_IOMUX         0x0098
++#define RK3188_GRF_GPIO3D_IOMUX         0x009c
++#define RK3188_GRF_SOC_CON0             0x00a0
++#define RK3188_GRF_SOC_CON1             0x00a4
++#define RK3188_GRF_SOC_CON2             0x00a8
++#define RK3188_GRF_SOC_STATUS0          0x00ac
++#define RK3188_GRF_DMAC1_CON0           0x00b0
++#define RK3188_GRF_DMAC1_CON1           0x00b4
++#define RK3188_GRF_DMAC1_CON2           0x00b8
++#define RK3188_GRF_DMAC2_CON0           0x00bc
++#define RK3188_GRF_DMAC2_CON1           0x00c0
++#define RK3188_GRF_DMAC2_CON2           0x00c4
++#define RK3188_GRF_DMAC2_CON3           0x00c8
++#define RK3188_GRF_CPU_CON0             0x00cc
++#define RK3188_GRF_CPU_CON1             0x00d0
++#define RK3188_GRF_CPU_CON2             0x00d4
++#define RK3188_GRF_CPU_CON3             0x00d8
++#define RK3188_GRF_CPU_CON4             0x00dc
++#define RK3188_GRF_CPU_CON5             0x00e0
++
++#define RK3188_GRF_DDRC_CON0            0x00ec
++#define RK3188_GRF_DDRC_STAT            0x00f0
++#define RK3188_GRF_IO_CON0              0x00f4
++#define RK3188_GRF_IO_CON1              0x00f8
++#define RK3188_GRF_IO_CON2              0x00fc
++#define RK3188_GRF_IO_CON3              0x0100
++#define RK3188_GRF_IO_CON4              0x0104
++#define RK3188_GRF_SOC_STATUS1          0x0108
++#define RK3188_GRF_UOC0_CON0            0x010c
++#define RK3188_GRF_UOC0_CON1            0x0110
++#define RK3188_GRF_UOC0_CON2            0x0114
++#define RK3188_GRF_UOC0_CON3            0x0118
++#define RK3188_GRF_UOC1_CON0            0x011c
++#define RK3188_GRF_UOC1_CON1            0x0120
++#define RK3188_GRF_UOC1_CON2            0x0124
++#define RK3188_GRF_UOC1_CON3            0x0128
++#define RK3188_GRF_UOC2_CON0            0x012c
++#define RK3188_GRF_UOC2_CON1            0x0130
++
++#define RK3188_GRF_UOC3_CON0            0x0138
++#define RK3188_GRF_UOC3_CON1            0x013c
++#define RK3188_GRF_EHCI_STAT            0x0140
++#define RK3188_GRF_OS_REG0              0x0144
++#define RK3188_GRF_OS_REG1              0x0148
++#define RK3188_GRF_OS_REG2              0x014c
++#define RK3188_GRF_OS_REG3              0x0150
++#define RK3188_GRF_OS_REG4              0x0154
++#define RK3188_GRF_OS_REG5              0x0158
++#define RK3188_GRF_OS_REG6              0x015c
++#define RK3188_GRF_OS_REG7              0x0160
++#define RK3188_GRF_GPIO0B_PULL          0x0164
++#define RK3188_GRF_GPIO0C_PULL          0x0168
++#define RK3188_GRF_GPIO0D_PULL          0x016c
++#define RK3188_GRF_GPIO1A_PULL          0x0170
++#define RK3188_GRF_GPIO1B_PULL          0x0174
++#define RK3188_GRF_GPIO1C_PULL          0x0178
++#define RK3188_GRF_GPIO1D_PULL          0x017c
++#define RK3188_GRF_GPIO2A_PULL          0x0180
++#define RK3188_GRF_GPIO2B_PULL          0x0184
++#define RK3188_GRF_GPIO2C_PULL          0x0188
++#define RK3188_GRF_GPIO2D_PULL          0x018c
++#define RK3188_GRF_GPIO3A_PULL          0x0190
++#define RK3188_GRF_GPIO3B_PULL          0x0194
++#define RK3188_GRF_GPIO3C_PULL          0x0198
++#define RK3188_GRF_GPIO3D_PULL          0x019c
++#define RK3188_GRF_FLASH_DATA_PULL      0x01a0
++#define RK3188_GRF_FLASH_CMD_PULL       0x01a4
++
++
++#define RK3288_GRF_GPIO0_A_IOMUX	0x0084
++#define RK3288_GRF_GPIO0_B_IOMUX	0x0088
++#define RK3288_GRF_GPIO0_C_IOMUX	0x008c
++
++#define RK3288_GRF_GPIO1D_IOMUX         0x000c
++#define RK3288_GRF_GPIO2A_IOMUX         0x0010
++#define RK3288_GRF_GPIO2B_IOMUX         0x0014
++#define RK3288_GRF_GPIO2C_IOMUX         0x0018
++
++#define RK3288_GRF_GPIO3A_IOMUX         0x0020
++#define RK3288_GRF_GPIO3B_IOMUX         0x0024
++#define RK3288_GRF_GPIO3C_IOMUX         0x0028
++#define RK3288_GRF_GPIO3DL_IOMUX        0x002c
++#define RK3288_GRF_GPIO3DH_IOMUX        0x0030
++#define RK3288_GRF_GPIO4AL_IOMUX        0x0034
++#define RK3288_GRF_GPIO4AH_IOMUX        0x0038
++#define RK3288_GRF_GPIO4BL_IOMUX        0x003c
++
++#define RK3288_GRF_GPIO4C_IOMUX         0x0044
++#define RK3288_GRF_GPIO4D_IOMUX         0x0048
++
++#define RK3288_GRF_GPIO5B_IOMUX         0x0050
++#define RK3288_GRF_GPIO5C_IOMUX         0x0054
++
++#define RK3288_GRF_GPIO6A_IOMUX         0x005c
++#define RK3288_GRF_GPIO6B_IOMUX         0x0060
++#define RK3288_GRF_GPIO6C_IOMUX         0x0064
++
++#define RK3288_GRF_GPIO7A_IOMUX         0x006c
++#define RK3288_GRF_GPIO7B_IOMUX         0x0070
++#define RK3288_GRF_GPIO7CL_IOMUX        0x0074
++#define RK3288_GRF_GPIO7CH_IOMUX        0x0078
++
++#define RK3288_GRF_GPIO8A_IOMUX         0x0080
++#define RK3288_GRF_GPIO8B_IOMUX         0x0084
++
++#define RK3288_GRF_GPIO1H_SR            0x0104
++#define RK3288_GRF_GPIO2L_SR            0x0108
++#define RK3288_GRF_GPIO2H_SR            0x010c
++#define RK3288_GRF_GPIO3L_SR            0x0110
++#define RK3288_GRF_GPIO3H_SR            0x0114
++#define RK3288_GRF_GPIO4L_SR            0x0118
++#define RK3288_GRF_GPIO4H_SR            0x011c
++#define RK3288_GRF_GPIO5L_SR            0x0120
++#define RK3288_GRF_GPIO5H_SR            0x0124
++#define RK3288_GRF_GPIO6L_SR            0x0128
++#define RK3288_GRF_GPIO6H_SR            0x012c
++#define RK3288_GRF_GPIO7L_SR            0x0130
++#define RK3288_GRF_GPIO7H_SR            0x0134
++#define RK3288_GRF_GPIO8L_SR            0x0138
++
++#define RK3288_GRF_GPIO1D_P             0x014c
++#define RK3288_GRF_GPIO2A_P             0x0150
++#define RK3288_GRF_GPIO2B_P             0x0154
++#define RK3288_GRF_GPIO2C_P             0x0158
++
++#define RK3288_GRF_GPIO3A_P             0x0160
++#define RK3288_GRF_GPIO3B_P             0x0164
++#define RK3288_GRF_GPIO3C_P             0x0168
++#define RK3288_GRF_GPIO3D_P             0x016c
++#define RK3288_GRF_GPIO4A_P             0x0170
++#define RK3288_GRF_GPIO4B_P             0x0174
++#define RK3288_GRF_GPIO4C_P             0x0178
++#define RK3288_GRF_GPIO4D_P             0x017c
++
++#define RK3288_GRF_GPIO5B_P             0x0184
++#define RK3288_GRF_GPIO5C_P             0x0188
++
++#define RK3288_GRF_GPIO6A_P             0x0190
++#define RK3288_GRF_GPIO6B_P             0x0194
++#define RK3288_GRF_GPIO6C_P             0x0198
++
++#define RK3288_GRF_GPIO7A_P             0x01a0
++#define RK3288_GRF_GPIO7B_P             0x01a4
++#define RK3288_GRF_GPIO7C_P             0x01a8
++
++#define RK3288_GRF_GPIO8A_P             0x01b0
++#define RK3288_GRF_GPIO8B_P             0x01b4
++
++#define RK3288_GRF_GPIO1D_E             0x01cc
++#define RK3288_GRF_GPIO2A_E             0x01d0
++#define RK3288_GRF_GPIO2B_E             0x01d4
++#define RK3288_GRF_GPIO2C_E             0x01d8
++
++#define RK3288_GRF_GPIO3A_E             0x01e0
++#define RK3288_GRF_GPIO3B_E             0x01e4
++#define RK3288_GRF_GPIO3C_E             0x01e8
++#define RK3288_GRF_GPIO3D_E             0x01ec
++#define RK3288_GRF_GPIO4A_E             0x01f0
++#define RK3288_GRF_GPIO4B_E             0x01f4
++#define RK3288_GRF_GPIO4C_E             0x01f8
++#define RK3288_GRF_GPIO4D_E             0x01fc
++
++#define RK3288_GRF_GPIO5B_E             0x0204
++#define RK3288_GRF_GPIO5C_E             0x0208
++
++#define RK3288_GRF_GPIO6A_E             0x0210
++#define RK3288_GRF_GPIO6B_E             0x0214
++#define RK3288_GRF_GPIO6C_E             0x0218
++
++#define RK3288_GRF_GPIO7A_E             0x0220
++#define RK3288_GRF_GPIO7B_E             0x0224
++#define RK3288_GRF_GPIO7C_E             0x0228
++
++#define RK3288_GRF_GPIO8A_E             0x0230
++#define RK3288_GRF_GPIO8B_E             0x0234
++
++#define RK3288_GRF_GPIO_SMT             0x0240
++#define RK3288_GRF_SOC_CON0             0x0244
++#define RK3288_GRF_SOC_CON1             0x0248
++#define RK3288_GRF_SOC_CON2             0x024c
++#define RK3288_GRF_SOC_CON3             0x0250
++#define RK3288_GRF_SOC_CON4             0x0254
++#define RK3288_GRF_SOC_CON5             0x0258
++#define RK3288_GRF_SOC_CON6             0x025c
++#define RK3288_GRF_SOC_CON7             0x0260
++#define RK3288_GRF_SOC_CON8             0x0264
++#define RK3288_GRF_SOC_CON9             0x0268
++#define RK3288_GRF_SOC_CON10            0x026c
++#define RK3288_GRF_SOC_CON11            0x0270
++#define RK3288_GRF_SOC_CON12            0x0274
++#define RK3288_GRF_SOC_CON13            0x0278
++#define RK3288_GRF_SOC_CON14            0x027c
++#define RK3288_GRF_SOC_STATUS0          0x0280
++#define RK3288_GRF_SOC_STATUS1          0x0284
++#define RK3288_GRF_SOC_STATUS2          0x0288
++#define RK3288_GRF_SOC_STATUS3          0x028c
++#define RK3288_GRF_SOC_STATUS4          0x0290
++#define RK3288_GRF_SOC_STATUS5          0x0294
++#define RK3288_GRF_SOC_STATUS6          0x0298
++#define RK3288_GRF_SOC_STATUS7          0x029c
++#define RK3288_GRF_SOC_STATUS8          0x02a0
++#define RK3288_GRF_SOC_STATUS9          0x02a4
++#define RK3288_GRF_SOC_STATUS10         0x02a8
++#define RK3288_GRF_SOC_STATUS11         0x02ac
++#define RK3288_GRF_SOC_STATUS12         0x02b0
++#define RK3288_GRF_SOC_STATUS13         0x02b4
++#define RK3288_GRF_SOC_STATUS14         0x02b8
++#define RK3288_GRF_SOC_STATUS15         0x02bc
++#define RK3288_GRF_SOC_STATUS16         0x02c0
++#define RK3288_GRF_SOC_STATUS17         0x02c4
++#define RK3288_GRF_SOC_STATUS18         0x02c8
++#define RK3288_GRF_SOC_STATUS19         0x02cc
++#define RK3288_GRF_SOC_STATUS20         0x02d0
++#define RK3288_GRF_SOC_STATUS21         0x02d4
++
++#define RK3288_GRF_PERIDMAC_CON0        0x02e0
++#define RK3288_GRF_PERIDMAC_CON1        0x02e4
++#define RK3288_GRF_PERIDMAC_CON2        0x02e8
++#define RK3288_GRF_PERIDMAC_CON3        0x02ec
++#define RK3288_GRF_DDRC0_CON0           0x02f0
++#define RK3288_GRF_DDRC1_CON0           0x02f4
++#define RK3288_GRF_CPU_CON0             0x02f8
++#define RK3288_GRF_CPU_CON1             0x02fc
++#define RK3288_GRF_CPU_CON2             0x0300
++#define RK3288_GRF_CPU_CON3             0x0304
++#define RK3288_GRF_CPU_CON4             0x0308
++
++#define RK3288_GRF_CPU_STATUS0          0x0318
++
++#define RK3288_GRF_UOC0_CON0            0x0320
++#define RK3288_GRF_UOC0_CON1            0x0324
++#define RK3288_GRF_UOC0_CON2            0x0328
++#define RK3288_GRF_UOC0_CON3            0x032c
++#define RK3288_GRF_UOC0_CON4            0x0330
++#define RK3288_GRF_UOC1_CON0            0x0334
++#define RK3288_GRF_UOC1_CON1            0x0338
++#define RK3288_GRF_UOC1_CON2            0x033c
++#define RK3288_GRF_UOC1_CON3            0x0340
++#define RK3288_GRF_UOC1_CON4            0x0344
++#define RK3288_GRF_UOC2_CON0            0x0348
++#define RK3288_GRF_UOC2_CON1            0x034c
++#define RK3288_GRF_UOC2_CON2            0x0350
++#define RK3288_GRF_UOC2_CON3            0x0354
++#define RK3288_GRF_UOC3_CON0            0x0358
++#define RK3288_GRF_UOC3_CON1            0x035c
++#define RK3288_GRF_UOC4_CON0            0x0360
++#define RK3288_GRF_UOC4_CON1            0x0364
++#define RK3288_GRF_PVTM_CON0            0x0368
++#define RK3288_GRF_PVTM_CON1            0x036c
++#define RK3288_GRF_PVTM_CON2            0x0370
++#define RK3288_GRF_PVTM_STATUS0         0x0374
++#define RK3288_GRF_PVTM_STATUS1         0x0378
++#define RK3288_GRF_PVTM_STATUS2         0x037c
++#define RK3288_GRF_IO_VSEL              0x0380
++#define RK3288_GRF_SARADC_TESTBIT       0x0384
++#define RK3288_GRF_TSADC_TESTBIT_L      0x0388
++#define RK3288_GRF_TSADC_TESTBIT_H      0x038c
++#define RK3288_GRF_OS_REG0              0x0390
++#define RK3288_GRF_OS_REG1              0x0394
++#define RK3288_GRF_OS_REG2              0x0398
++#define RK3288_GRF_OS_REG3              0x039c
++
++#define RK3288_GRF_SOC_CON15            0x03a4
++#define RK3288_GRF_SOC_CON16            0x03a8
++
++#define RK3288_SGRF_SOC_CON0            0x0000
++#define RK3288_SGRF_SOC_CON1            0x0004
++#define RK3288_SGRF_SOC_CON2            0x0008
++#define RK3288_SGRF_SOC_CON3            0x000c
++#define RK3288_SGRF_SOC_CON4            0x0010
++#define RK3288_SGRF_SOC_CON5            0x0014
++
++#define RK3288_SGRF_BUSDMAC_CON0        0x0020
++#define RK3288_SGRF_BUSDMAC_CON1        0x0024
++
++#define RK3288_SGRF_CPU_CON0            0x0040
++#define RK3288_SGRF_CPU_CON1            0x0044
++#define RK3288_SGRF_CPU_CON2            0x0048
++
++#define RK3288_SGRF_SOC_CON6            0x0050
++#define RK3288_SGRF_SOC_CON7            0x0054
++#define RK3288_SGRF_SOC_CON8            0x0058
++#define RK3288_SGRF_SOC_CON9            0x005c
++#define RK3288_SGRF_SOC_CON10           0x0060
++#define RK3288_SGRF_SOC_CON11           0x0064
++#define RK3288_SGRF_SOC_CON12           0x0068
++#define RK3288_SGRF_SOC_CON13           0x006c
++#define RK3288_SGRF_SOC_CON14           0x0070
++#define RK3288_SGRF_SOC_CON15           0x0074
++#define RK3288_SGRF_SOC_CON16           0x0078
++#define RK3288_SGRF_SOC_CON17           0x007c
++#define RK3288_SGRF_SOC_CON18           0x0080
++#define RK3288_SGRF_SOC_CON19           0x0084
++#define RK3288_SGRF_SOC_CON20           0x0088
++#define RK3288_SGRF_SOC_CON21           0x008c
++
++#define RK3288_SGRF_SOC_STATUS0         0x0100
++#define RK3288_SGRF_SOC_STATUS1         0x0104
++
++#define RK3288_SGRF_FAST_BOOT_ADDR      0x0120
++
++
++#define RK3036_GRF_GPIO0A_IOMUX         0x000a8
++#define RK3036_GRF_GPIO0B_IOMUX         0x000ac
++#define RK3036_GRF_GPIO0C_IOMUX         0x000b0
++#define RK3036_GRF_GPIO0D_IOMUX         0x000b4
++#define RK3036_GRF_GPIO1A_IOMUX         0x000b8
++#define RK3036_GRF_GPIO1B_IOMUX         0x000bc
++#define RK3036_GRF_GPIO1C_IOMUX         0x000c0
++#define RK3036_GRF_GPIO1D_IOMUX         0x000c4
++#define RK3036_GRF_GPIO2A_IOMUX         0x000c8
++#define RK3036_GRF_GPIO2B_IOMUX         0x000cc
++#define RK3036_GRF_GPIO2C_IOMUX         0x000d0
++#define RK3036_GRF_GPIO2D_IOMUX         0x000d4
++#define RK3036_GRF_GPIO_DS              0x00100
++#define RK3036_GRF_GPIO0L_PULL          0x00118
++#define RK3036_GRF_GPIO0H_PULL          0x0011c
++#define RK3036_GRF_GPIO1L_PULL          0x00120
++#define RK3036_GRF_GPIO1H_PULL          0x00124
++
++#define RK3036_GRF_GPIO2L_PULL 0x00128
++#define RK3036_GRF_GPIO2H_PULL 0x0012c
++#define RK3036_GRF_SOC_CON0 0x00140
++#define RK3036_GRF_SOC_CON1 0x00144
++#define RK3036_GRF_SOC_CON2 0x00148
++#define RK3036_GRF_SOC_STATUS0 0x0014c
++#define RK3036_GRF_SOC_CON3 0x00154
++#define RK3036_GRF_DMAC_CON0 0x0015c
++#define RK3036_GRF_DMAC_CON1 0x00160
++#define RK3036_GRF_DMAC_CON2 0x00164
++#define RK3036_GRF_UOC0_CON5 0x0017c
++#define RK3036_GRF_UOC1_CON4 0x00190
++#define RK3036_GRF_UOC1_CON5 0x00194
++#define RK3036_GRF_DDRC_STAT 0x0019c
++#define RK3036_GRF_UOC_CON6 0x001a0
++#define RK3036_GRF_SOC_STATUS1 0x001a4
++#define RK3036_GRF_CPU_CON0 0x001a8
++#define RK3036_GRF_CPU_CON1 0x001ac
++#define RK3036_GRF_CPU_CON2 0x001b0
++#define RK3036_GRF_CPU_CON3 0x001b4
++#define RK3036_GRF_CPU_STATUS0 0x001c0
++#define RK3036_GRF_CPU_STATUS1 0x001c4
++#define RK3036_GRF_OS_REG0 0x001c8
++#define RK3036_GRF_OS_REG1 0x001cc
++#define RK3036_GRF_OS_REG2 0x001d0
++#define RK3036_GRF_OS_REG3 0x001d4
++#define RK3036_GRF_OS_REG4 0x001d8
++#define RK3036_GRF_OS_REG5 0x001dc
++#define RK3036_GRF_OS_REG6 0x001e0
++#define RK3036_GRF_OS_REG7 0x001e4
++#define RK3036_GRF_DLL_CON0 0x00200
++#define RK3036_GRF_DLL_CON1 0x00204
++#define RK3036_GRF_DLL_CON2 0x00208
++#define RK3036_GRF_DLL_CON3 0x0020c
++#define RK3036_GRF_DLL_STATUS0 0x00210
++#define RK3036_GRF_DLL_STATUS1 0x00214
++
++#define RK3036_GRF_DLL_STATUS2 0x00218
++#define RK3036_GRF_DLL_STATUS3 0x0021c
++#define RK3036_GRF_DFI_WRNUM 0x00220
++#define RK3036_GRF_DFI_RDNUM 0x00224
++#define RK3036_GRF_DFI_ACTNUM 0x00228
++#define RK3036_GRF_DFI_TIMERVAL 0x0022c
++#define RK3036_GRF_NIF_FIFO0 0x00230
++#define RK3036_GRF_NIF_FIFO1 0x00234
++#define RK3036_GRF_NIF_FIFO2 0x00238
++#define RK3036_GRF_NIF_FIFO3 0x0023c
++#define RK3036_GRF_USBPHY0_CON0 0x00280
++#define RK3036_GRF_USBPHY0_CON1 0x00284
++#define RK3036_GRF_USBPHY0_CON2 0x00288
++#define RK3036_GRF_USBPHY0_CON3 0x0028c
++#define RK3036_GRF_USBPHY0_CON4 0x00290
++#define RK3036_GRF_USBPHY0_CON5 0x00294
++#define RK3036_GRF_USBPHY0_CON6 0x00298
++#define RK3036_GRF_USBPHY0_CON7 0x0029c
++#define RK3036_GRF_USBPHY1_CON0 0x002a0
++#define RK3036_GRF_USBPHY1_CON1 0x002a4
++#define RK3036_GRF_USBPHY1_CON2 0x002a8
++#define RK3036_GRF_USBPHY1_CON3 0x002ac
++#define RK3036_GRF_USBPHY1_CON4 0x002b0
++#define RK3036_GRF_USBPHY1_CON5 0x002b4
++#define RK3036_GRF_USBPHY1_CON6 0x002b8
++
++#define RK3036_GRF_USBPHY1_CON7 0x002bc
++#define RK3036_GRF_CHIP_TAG 0x00300
++#define RK3036_GRF_SDMMC_DET_CNT 0x00304
++
++#define RK312X_GRF_GPIO0A_IOMUX         0x000a8
++#define RK312X_GRF_GPIO0B_IOMUX         0x000ac
++#define RK312X_GRF_GPIO0C_IOMUX         0x000b0
++#define RK312X_GRF_GPIO0D_IOMUX         0x000b4
++#define RK312X_GRF_GPIO1A_IOMUX         0x000b8
++#define RK312X_GRF_GPIO1B_IOMUX         0x000bc
++#define RK312X_GRF_GPIO1C_IOMUX         0x000c0
++#define RK312X_GRF_GPIO1D_IOMUX         0x000c4
++#define RK312X_GRF_GPIO2A_IOMUX         0x000c8
++#define RK312X_GRF_GPIO2B_IOMUX         0x000cc
++#define RK312X_GRF_GPIO2C_IOMUX         0x000d0
++#define RK312X_GRF_GPIO2D_IOMUX         0x000d4
++#define RK312X_GRF_GPIO3A_IOMUX         0x000d8
++#define RK312X_GRF_GPIO3B_IOMUX         0x000dc
++#define RK312X_GRF_GPIO3C_IOMUX         0x000e0
++#define RK312X_GRF_GPIO3D_IOMUX         0x000e4
++#define RK312X_GRF_CIF_IOMUX		0x000ec
++#define RK312X_GRF_CIF_IOMUX1 		0x000f0
++#define RK312X_GRF_GPIO_DS              0x00100
++#define RK312X_GRF_GPIO0L_PULL          0x00118
++#define RK312X_GRF_GPIO0H_PULL          0x0011c
++#define RK312X_GRF_GPIO1L_PULL          0x00120
++#define RK312X_GRF_GPIO1H_PULL          0x00124
++#define RK312X_GRF_GPIO2L_PULL          0x00128
++#define RK312X_GRF_GPIO2H_PULL          0x0012c
++#define RK312X_GRF_GPIO3L_PULL          0x00130
++#define RK312X_GRF_GPIO3H_PULL          0x00134
++#define RK312X_GRF_ACODEC_CON		0x0013c
++
++#define RK312X_GRF_SOC_CON0 0x00140
++#define RK312X_GRF_SOC_CON1 0x00144
++#define RK312X_GRF_SOC_CON2 0x00148
++#define RK312X_GRF_SOC_STATUS0 0x0014c
++#define RK312X_GRF_LVDS_CON0 0x00150
++#define RK312X_GRF_SOC_CON3 0x00154
++#define RK312X_GRF_DMAC_CON0 0x0015c
++#define RK312X_GRF_DMAC_CON1 0x00160
++#define RK312X_GRF_DMAC_CON2 0x00164
++#define RK312X_GRF_MAC_CON0 0x00168
++#define RK312X_GRF_MAC_CON1 0x0016c
++#define RK312X_GRF_TVE_CON 0x00170
++#define RK312X_GRF_UOC0_CON0 0x0017c
++#define RK312X_GRF_UOC1_CON1 0x00184
++#define RK312X_GRF_UOC1_CON2 0x00188
++#define RK312X_GRF_UOC1_CON3 0x0018c
++#define RK312X_GRF_UOC1_CON4 0x00190
++#define RK312X_GRF_UOC1_CON5 0x00194
++#define RK312X_GRF_DDRC_STAT 0x0019c
++#define RK312X_GRF_SOC_STATUS1 0x001a4
++#define RK312X_GRF_CPU_CON0 0x001a8
++#define RK312X_GRF_CPU_CON1 0x001ac
++#define RK312X_GRF_CPU_CON2 0x001b0
++#define RK312X_GRF_CPU_CON3 0x001b4
++#define RK312X_GRF_CPU_STATUS0 0x001c0
++#define RK312X_GRF_CPU_STATUS1 0x001c4
++#define RK312X_GRF_OS_REG0 0x001c8
++#define RK312X_GRF_OS_REG1 0x001cc
++#define RK312X_GRF_OS_REG2 0x001d0
++#define RK312X_GRF_OS_REG3 0x001d4
++#define RK312X_GRF_OS_REG4 0x001d8
++#define RK312X_GRF_OS_REG5 0x001dc
++#define RK312X_GRF_OS_REG6 0x001e0
++#define RK312X_GRF_OS_REG7 0x001e4
++#define RK312X_GRF_PVTM_CON0 0x00200
++#define RK312X_GRF_PVTM_CON1 0x00204
++#define RK312X_GRF_PVTM_CON2 0x00208
++#define RK312X_GRF_PVTM_CON3 0x0020c
++#define RK312X_GRF_PVTM_STATUS0 0x00210
++#define RK312X_GRF_PVTM_STATUS1 0x00214
++#define RK312X_GRF_PVTM_STATUS2 0x00218
++#define RK312X_GRF_PVTM_STATUS3 0x0021c
++#define RK312X_GRF_DFI_WRNUM 0x00220
++#define RK312X_GRF_DFI_RDNUM 0x00224
++#define RK312X_GRF_DFI_ACTNUM 0x00228
++#define RK312X_GRF_DFI_TIMERVAL 0x0022c
++#define RK312X_GRF_NIF_FIFO0 0x00230
++#define RK312X_GRF_NIF_FIFO1 0x00234
++#define RK312X_GRF_NIF_FIFO2 0x00238
++#define RK312X_GRF_NIF_FIFO3 0x0023c
++#define RK312X_GRF_USBPHY0_CON0 0x00280
++#define RK312X_GRF_USBPHY0_CON1 0x00284
++#define RK312X_GRF_USBPHY0_CON2 0x00288
++#define RK312X_GRF_USBPHY0_CON3 0x0028c
++#define RK312X_GRF_USBPHY0_CON4 0x00290
++#define RK312X_GRF_USBPHY0_CON5 0x00294
++#define RK312X_GRF_USBPHY0_CON6 0x00298
++#define RK312X_GRF_USBPHY0_CON7 0x0029c
++#define RK312X_GRF_USBPHY1_CON0 0x002a0
++#define RK312X_GRF_USBPHY1_CON1 0x002a4
++#define RK312X_GRF_USBPHY1_CON2 0x002a8
++#define RK312X_GRF_USBPHY1_CON3 0x002ac
++#define RK312X_GRF_USBPHY1_CON4 0x002b0
++#define RK312X_GRF_USBPHY1_CON5 0x002b4
++#define RK312X_GRF_USBPHY1_CON6 0x002b8
++#define RK312X_GRF_USBPHY1_CON7 0x002bc
++#define RK312X_GRF_UOC_STATUS0 0x002c0
++#define RK312X_GRF_CHIP_TAG 0x00300
++#define RK312X_GRF_SDMMC_DET_CNT 0x00304
++#define RK312X_GRF_EFUSE_PRG_EN 0x0037c
++
++#define RK3228_GRF_GPIO0A_IOMUX		0x0000
++#define RK3228_GRF_GPIO0B_IOMUX		0x0004
++#define RK3228_GRF_GPIO0C_IOMUX		0x0008
++#define RK3228_GRF_GPIO0D_IOMUX		0x000c
++#define RK3228_GRF_GPIO1A_IOMUX		0x0010
++#define RK3228_GRF_GPIO1B_IOMUX		0x0014
++#define RK3228_GRF_GPIO1C_IOMUX		0x0018
++#define RK3228_GRF_GPIO1D_IOMUX		0x001c
++#define RK3228_GRF_GPIO2A_IOMUX		0x0020
++#define RK3228_GRF_GPIO2B_IOMUX		0x0024
++#define RK3228_GRF_GPIO2C_IOMUX		0x0028
++#define RK3228_GRF_GPIO2D_IOMUX		0x002c
++#define RK3228_GRF_GPIO3A_IOMUX		0x0030
++#define RK3228_GRF_GPIO3B_IOMUX		0x0034
++#define RK3228_GRF_GPIO3C_IOMUX		0x0038
++#define RK3228_GRF_GPIO3D_IOMUX		0x003c
++#define RK3228_GRF_COM_IOMUX		0x0050
++#define RK3228_GRF_GPIO0A_P		0x0100
++#define RK3228_GRF_GPIO0B_P		0x0104
++#define RK3228_GRF_GPIO0C_P		0x0108
++#define RK3228_GRF_GPIO0D_P		0x010c
++#define RK3228_GRF_GPIO1A_P		0x0110
++#define RK3228_GRF_GPIO1B_P		0x0114
++#define RK3228_GRF_GPIO1C_P		0x0118
++#define RK3228_GRF_GPIO1D_P		0x011c
++#define RK3228_GRF_GPIO2A_P		0x0120
++#define RK3228_GRF_GPIO2B_P		0x0124
++#define RK3228_GRF_GPIO2C_P		0x0128
++#define RK3228_GRF_GPIO2D_P		0x012c
++#define RK3228_GRF_GPIO3A_P		0x0130
++#define RK3228_GRF_GPIO3B_P		0x0134
++#define RK3228_GRF_GPIO3C_P		0x0138
++#define RK3228_GRF_GPIO3D_P		0x013c
++#define RK3228_GRF_GPIO0A_E		0x0200
++#define RK3228_GRF_GPIO0B_E		0x0204
++#define RK3228_GRF_GPIO0C_E		0x0208
++#define RK3228_GRF_GPIO0D_E		0x020c
++#define RK3228_GRF_GPIO1A_E		0x0210
++#define RK3228_GRF_GPIO1B_E		0x0214
++#define RK3228_GRF_GPIO1C_E		0x0218
++#define RK3228_GRF_GPIO1D_E		0x021c
++#define RK3228_GRF_GPIO2A_E		0x0220
++#define RK3228_GRF_GPIO2B_E		0x0224
++#define RK3228_GRF_GPIO2C_E		0x0228
++#define RK3228_GRF_GPIO2D_E		0x022c
++#define RK3228_GRF_GPIO3A_E		0x0230
++#define RK3228_GRF_GPIO3B_E		0x0234
++#define RK3228_GRF_GPIO3C_E		0x0238
++#define RK3228_GRF_GPIO3D_E		0x023c
++#define RK3228_GRF_GPIO0L_SR		0x0300
++#define RK3228_GRF_GPIO0H_SR		0x0304
++#define RK3228_GRF_GPIO1L_SR		0x0308
++#define RK3228_GRF_GPIO1H_SR		0x030c
++#define RK3228_GRF_GPIO2L_SR		0x0310
++#define RK3228_GRF_GPIO2H_SR		0x0314
++#define RK3228_GRF_GPIO3L_SR		0x0318
++#define RK3228_GRF_GPIO3H_SR		0x031c
++#define RK3228_GRF_GPIO0L_SMT		0x0380
++#define RK3228_GRF_GPIO0H_SMT		0x0384
++#define RK3228_GRF_GPIO1L_SMT		0x0388
++#define RK3228_GRF_GPIO1H_SMT		0x038c
++#define RK3228_GRF_GPIO2L_SMT		0x0390
++#define RK3228_GRF_GPIO2H_SMT		0x0394
++#define RK3228_GRF_GPIO3L_SMT		0x0398
++#define RK3228_GRF_GPIO3H_SMT		0x039c
++#define RK3228_GRF_SOC_CON0		0x0400
++#define RK3228_GRF_SOC_CON1		0x0404
++#define RK3228_GRF_SOC_CON2		0x0408
++#define RK3228_GRF_SOC_CON3		0x040c
++#define RK3228_GRF_SOC_CON4		0x0410
++#define RK3228_GRF_SOC_CON5		0x0414
++#define RK3228_GRF_SOC_CON6		0x0418
++#define RK3228_GRF_SOC_STATUS0		0x0480
++#define RK3228_GRF_SOC_STATUS1		0x0484
++#define RK3228_GRF_SOC_STATUS2		0x0488
++#define RK3228_GRF_CHIP_ID		0x048c
++#define RK3228_GRF_CPU_CON0		0x0500
++#define RK3228_GRF_CPU_CON1		0x0504
++#define RK3228_GRF_CPU_CON2		0x0508
++#define RK3228_GRF_CPU_CON3		0x050c
++#define RK3228_GRF_CPU_STATUS0		0x0520
++#define RK3228_GRF_CPU_STATUS1		0x0524
++#define RK3228_GRF_OS_REG0		0x05c8
++#define RK3228_GRF_OS_REG1		0x05cc
++#define RK3228_GRF_OS_REG2		0x05d0
++#define RK3228_GRF_OS_REG3		0x05d4
++#define RK3228_GRF_OS_REG4		0x05d8
++#define RK3228_GRF_OS_REG5		0x05dc
++#define RK3228_GRF_OS_REG6		0x05e0
++#define RK3228_GRF_OS_REG7		0x05e4
++#define RK3228_GRF_DDRC_STAT		0x0604
++#define RK3228_GRF_SIG_DETECT_CON	0x0680
++#define RK3228_GRF_SIG_DETECT_CON1	0x0684
++#define RK3228_GRF_SIG_DETECT_STATUS	0x0690
++#define RK3228_GRF_SIG_DETECT_STATUS1	0x0694
++#define RK3228_GRF_SIG_DETECT_CLR	0x06a0
++#define RK3228_GRF_SIG_DETECT_CLR1	0x06a4
++#define RK3228_GRF_EMMC_DET		0x06b0
++#define RK3228_GRF_HOST0_CON0		0x0700
++#define RK3228_GRF_HOST0_CON1		0x0704
++#define RK3228_GRF_HOST0_CON2		0x0708
++#define RK3228_GRF_HOST1_CON0		0x0710
++#define RK3228_GRF_HOST1_CON1		0x0714
++#define RK3228_GRF_HOST1_CON2		0x0718
++#define RK3228_GRF_HOST2_CON0		0x0720
++#define RK3228_GRF_HOST2_CON1		0x0724
++#define RK3228_GRF_HOST2_CON2		0x0728
++#define RK3228_GRF_USBPHY0_CON0		0x0760
++#define RK3228_GRF_USBPHY0_CON1		0x0764
++#define RK3228_GRF_USBPHY0_CON2		0x0768
++#define RK3228_GRF_USBPHY0_CON3		0x076c
++#define RK3228_GRF_USBPHY0_CON4		0x0770
++#define RK3228_GRF_USBPHY0_CON5		0x0774
++#define RK3228_GRF_USBPHY0_CON6		0x0778
++#define RK3228_GRF_USBPHY0_CON7		0x077c
++#define RK3228_GRF_USBPHY0_CON8		0x0780
++#define RK3228_GRF_USBPHY0_CON9		0x0784
++#define RK3228_GRF_USBPHY0_CON10	0x0788
++#define RK3228_GRF_USBPHY0_CON11	0x078c
++#define RK3228_GRF_USBPHY0_CON12	0x0790
++#define RK3228_GRF_USBPHY0_CON13	0x0794
++#define RK3228_GRF_USBPHY0_CON14	0x0798
++#define RK3228_GRF_USBPHY0_CON15	0x079c
++#define RK3228_GRF_USBPHY0_CON16	0x07a0
++#define RK3228_GRF_USBPHY0_CON17	0x07a4
++#define RK3228_GRF_USBPHY0_CON18	0x07a8
++#define RK3228_GRF_USBPHY0_CON19	0x07ac
++#define RK3228_GRF_USBPHY0_CON20	0x07b0
++#define RK3228_GRF_USBPHY0_CON21	0x07b4
++#define RK3228_GRF_USBPHY0_CON22	0x07b8
++#define RK3228_GRF_USBPHY0_CON23	0x07bc
++#define RK3228_GRF_USBPHY0_CON24	0x07c0
++#define RK3228_GRF_USBPHY0_CON25	0x07c4
++#define RK3228_GRF_USBPHY0_CON26	0x07c8
++#define RK3228_GRF_USBPHY1_CON0		0x0800
++#define RK3228_GRF_USBPHY1_CON1		0x0804
++#define RK3228_GRF_USBPHY1_CON2		0x0808
++#define RK3228_GRF_USBPHY1_CON3		0x080c
++#define RK3228_GRF_USBPHY1_CON4		0x0810
++#define RK3228_GRF_USBPHY1_CON5		0x0814
++#define RK3228_GRF_USBPHY1_CON6		0x0818
++#define RK3228_GRF_USBPHY1_CON7		0x081c
++#define RK3228_GRF_USBPHY1_CON8		0x0820
++#define RK3228_GRF_USBPHY1_CON9		0x0824
++#define RK3228_GRF_USBPHY1_CON10	0x0828
++#define RK3228_GRF_USBPHY1_CON11	0x082c
++#define RK3228_GRF_USBPHY1_CON12	0x0830
++#define RK3228_GRF_USBPHY1_CON13	0x0834
++#define RK3228_GRF_USBPHY1_CON14	0x0838
++#define RK3228_GRF_USBPHY1_CON15	0x083c
++#define RK3228_GRF_USBPHY1_CON16	0x0840
++#define RK3228_GRF_USBPHY1_CON17	0x0844
++#define RK3228_GRF_USBPHY1_CON18	0x0848
++#define RK3228_GRF_USBPHY1_CON19	0x084c
++#define RK3228_GRF_USBPHY1_CON20	0x0850
++#define RK3228_GRF_USBPHY1_CON21	0x0854
++#define RK3228_GRF_USBPHY1_CON22	0x0858
++#define RK3228_GRF_USBPHY1_CON23	0x085c
++#define RK3228_GRF_USBPHY1_CON24	0x0860
++#define RK3228_GRF_USBPHY1_CON25	0x0864
++#define RK3228_GRF_USBPHY1_CON26	0x0868
++#define RK3228_GRF_OTG_CON0		0x0880
++#define RK3228_GRF_UOC_CON0		0x0884
++#define RK3228_GRF_MAC_CON0		0x0900
++#define RK3228_GRF_MAC_CON1		0x0904
++#define RK3228_GRF_MACPHY_CON0		0x0b00
++#define RK3228_GRF_MACPHY_CON1		0x0b04
++#define RK3228_GRF_MACPHY_CON2		0x0b08
++#define RK3228_GRF_MACPHY_CON3		0x0b0c
++#define RK3228_GRF_MACPHY_STATUS	0x0b10
++
++#endif
+diff --git a/include/linux/rockchip/iomap.h b/include/linux/rockchip/iomap.h
+new file mode 100755
+index 0000000..e6ffe50
+--- /dev/null
++++ b/include/linux/rockchip/iomap.h
+@@ -0,0 +1,228 @@
++#ifndef __MACH_ROCKCHIP_IOMAP_H
++#define __MACH_ROCKCHIP_IOMAP_H
++
++#ifndef __ASSEMBLY__
++#include <asm/io.h>
++#endif
++
++#ifdef IOMEM
++#define RK_IO_ADDRESS(x)                IOMEM(0xFED00000 + x)
++#else
++#define RK_IO_ADDRESS(x)                ((void __force __iomem *)(0xFED00000 + x))
++#endif
++
++#define RK_CRU_VIRT                     RK_IO_ADDRESS(0x00000000)
++#define RK_GRF_VIRT                     RK_IO_ADDRESS(0x00010000)
++#define RK_SGRF_VIRT                    (RK_GRF_VIRT + 0x1000)
++#define RK_PMU_VIRT                     RK_IO_ADDRESS(0x00020000)
++#define RK_ROM_VIRT                     RK_IO_ADDRESS(0x00030000)
++#define RK_EFUSE_VIRT                   RK_IO_ADDRESS(0x00040000)
++#define RK_GPIO_VIRT(n)                 RK_IO_ADDRESS(0x00050000 + (n) * 0x1000)
++#define RK_DEBUG_UART_VIRT              RK_IO_ADDRESS(0x00060000)
++#define RK_CPU_AXI_BUS_VIRT             RK_IO_ADDRESS(0x00070000)
++#define RK_TIMER_VIRT                   RK_IO_ADDRESS(0x00080000)
++#define RK_PWM_VIRT			RK_IO_ADDRESS(0x00088000)
++#define RK_GIC_VIRT                     RK_IO_ADDRESS(0x00090000)
++#define RK_BOOTRAM_VIRT                 RK_IO_ADDRESS(0x000a0000)
++#define RK_DDR_VIRT                     RK_IO_ADDRESS(0x000d0000)
++
++#define RK3188_CRU_PHYS                 0x20000000
++#define RK3188_CRU_SIZE                 SZ_4K
++#define RK3188_GRF_PHYS                 0x20008000
++#define RK3188_GRF_SIZE                 SZ_4K
++#define RK3188_PMU_PHYS                 0x20004000
++#define RK3188_PMU_SIZE                 SZ_4K
++#define RK3188_ROM_PHYS                 0x10120000
++#define RK3188_ROM_SIZE                 SZ_16K
++#define RK3188_EFUSE_PHYS               0x20010000
++#define RK3188_EFUSE_SIZE               SZ_4K
++#define RK3188_GPIO0_PHYS               0x2000a000
++#define RK3188_GPIO1_PHYS               0x2003c000
++#define RK3188_GPIO2_PHYS               0x2003e000
++#define RK3188_GPIO3_PHYS               0x20080000
++#define RK3188_GPIO_SIZE                SZ_4K
++#define RK3188_CPU_AXI_BUS_PHYS         0x10128000
++#define RK3188_CPU_AXI_BUS_SIZE         SZ_32K
++#define RK3188_TIMER0_PHYS              0x20038000
++#define RK3188_TIMER3_PHYS              0x2000e000
++#define RK3188_TIMER_SIZE               SZ_4K
++#define RK3188_DDR_PCTL_PHYS            0x20020000
++#define RK3188_DDR_PCTL_SIZE            SZ_4K
++#define RK3188_DDR_PUBL_PHYS            0x20040000
++#define RK3188_DDR_PUBL_SIZE            SZ_4K
++#define RK3188_UART0_PHYS               0x10124000
++#define RK3188_UART1_PHYS               0x10126000
++#define RK3188_UART2_PHYS               0x20064000
++#define RK3188_UART3_PHYS               0x20068000
++#define RK3188_UART_SIZE                SZ_4K
++
++#define RK3288_CRU_PHYS                 0xFF760000
++#define RK3288_CRU_SIZE                 SZ_4K
++#define RK3288_GRF_PHYS                 0xFF770000
++#define RK3288_GRF_SIZE                 SZ_4K
++#define RK3288_SGRF_PHYS                0xFF740000
++#define RK3288_SGRF_SIZE                SZ_4K
++#define RK3288_PMU_PHYS                 0xFF730000
++#define RK3288_PMU_SIZE                 SZ_4K
++#define RK3288_ROM_PHYS                 0xFFFD0000
++#define RK3288_ROM_SIZE                 (SZ_16K + SZ_4K)
++#define RK3288_EFUSE_PHYS               0xFFB40000
++#define RK3288_EFUSE_SIZE               SZ_4K
++#define RK3288_GPIO0_PHYS               0xFF750000
++#define RK3288_GPIO1_PHYS               0xFF780000
++#define RK3288_GPIO2_PHYS               0xFF790000
++#define RK3288_GPIO3_PHYS               0xFF7A0000
++#define RK3288_GPIO4_PHYS               0xFF7B0000
++#define RK3288_GPIO5_PHYS               0xFF7C0000
++#define RK3288_GPIO6_PHYS               0xFF7D0000
++#define RK3288_GPIO7_PHYS               0xFF7E0000
++#define RK3288_GPIO8_PHYS               0xFF7F0000
++#define RK3288_GPIO_SIZE                SZ_4K
++#define RK3288_SERVICE_CORE_PHYS        0XFFA80000
++#define RK3288_SERVICE_CORE_SIZE        SZ_4K
++#define RK3288_SERVICE_DMAC_PHYS        0XFFA90000
++#define RK3288_SERVICE_DMAC_SIZE        SZ_4K
++#define RK3288_SERVICE_GPU_PHYS         0XFFAA0000
++#define RK3288_SERVICE_GPU_SIZE         SZ_4K
++#define RK3288_SERVICE_PERI_PHYS        0XFFAB0000
++#define RK3288_SERVICE_PERI_SIZE        SZ_4K
++#define RK3288_SERVICE_BUS_PHYS         0XFFAC0000
++#define RK3288_SERVICE_BUS_SIZE         SZ_16K
++#define RK3288_SERVICE_VIO_PHYS         0XFFAD0000
++#define RK3288_SERVICE_VIO_SIZE         SZ_4K
++#define RK3288_SERVICE_VIDEO_PHYS       0XFFAE0000
++#define RK3288_SERVICE_VIDEO_SIZE       SZ_4K
++#define RK3288_SERVICE_HEVC_PHYS        0XFFAF0000
++#define RK3288_SERVICE_HEVC_SIZE        SZ_4K
++#define RK3288_TIMER0_PHYS              0xFF6B0000
++#define RK3288_TIMER6_PHYS              0xFF810000
++#define RK3288_TIMER_SIZE               SZ_4K
++#define RK3288_DDR_PCTL0_PHYS           0xFF610000
++#define RK3288_DDR_PCTL1_PHYS           0xFF630000
++#define RK3288_DDR_PCTL_SIZE            SZ_4K
++#define RK3288_DDR_PUBL0_PHYS           0xFF620000
++#define RK3288_DDR_PUBL1_PHYS           0xFF640000
++#define RK3288_DDR_PUBL_SIZE            SZ_4K
++#define RK3288_UART_BT_PHYS             0xFF180000
++#define RK3288_UART_BB_PHYS             0xFF190000
++#define RK3288_UART_DBG_PHYS            0xFF690000
++#define RK3288_UART_GPS_PHYS            0xFF1B0000
++#define RK3288_UART_EXP_PHYS            0xFF1C0000
++#define RK3288_UART_SIZE                SZ_4K
++#define RK3288_GIC_DIST_PHYS            0xFFC01000
++#define RK3288_GIC_DIST_SIZE            SZ_4K
++#define RK3288_GIC_CPU_PHYS             0xFFC02000
++#define RK3288_GIC_CPU_SIZE             SZ_4K
++#define RK3288_BOOTRAM_PHYS             0xFF720000
++#define RK3288_BOOTRAM_SIZE             SZ_4K
++#define RK3288_IMEM_PHYS                0xFF700000
++#define RK3288_IMEM_SZIE                0x00018000
++
++#define RK3036_IMEM_PHYS		0x10080000
++#define RK3036_IMEM_SIZE		SZ_8K
++#define RK3036_ROM_PHYS			0x10100000
++#define RK3036_ROM_SIZE			SZ_16K
++#define RK3036_CPU_AXI_BUS_PHYS		0x10128000
++#define RK3036_CPU_AXI_BUS_SIZE		SZ_32K
++#define RK3036_GIC_DIST_PHYS		0x10139000
++#define RK3036_GIC_DIST_SIZE		SZ_4K
++#define RK3036_GIC_CPU_PHYS		0x1013a000
++#define RK3036_GIC_CPU_SIZE		SZ_4K
++#define RK3036_CRU_PHYS			0x20000000
++#define RK3036_CRU_SIZE			SZ_4K
++#define RK3036_DDR_PCTL_PHYS		0x20004000
++#define RK3036_DDR_PCTL_SIZE		SZ_4K
++#define RK3036_GRF_PHYS			0x20008000
++#define RK3036_GRF_SIZE			SZ_4K
++#define RK3036_DDR_PHY_PHYS		0x2000a000
++#define RK3036_DDR_PHY_SIZE		SZ_4K
++#define RK3036_TIMER_PHYS		0x20044000
++#define RK3036_TIMER_SIZE		SZ_4K
++#define RK3036_UART0_PHYS		0x20060000
++#define RK3036_UART1_PHYS		0x20064000
++#define RK3036_UART2_PHYS		0x20068000
++#define RK3036_UART_SIZE		SZ_4K
++#define RK3036_GPIO0_PHYS		0x2007c000
++#define RK3036_GPIO1_PHYS		0x20080000
++#define RK3036_GPIO2_PHYS		0x20084000
++#define RK3036_GPIO_SIZE		SZ_4K
++#define RK3036_EFUSE_PHYS		0x20090000
++#define RK3036_EFUSE_SIZE		SZ_4K
++#define RK3036_PWM_PHYS		0x20050000
++#define RK3036_PWM_SIZE		SZ_16K
++
++#define RK312X_IMEM_PHYS                RK3036_IMEM_PHYS
++#define RK312X_IMEM_SIZE                RK3036_IMEM_SIZE
++#define RK312X_ROM_PHYS                	RK3036_ROM_PHYS
++#define RK312X_ROM_SIZE                 RK3036_ROM_SIZE
++#define RK312X_CPU_AXI_BUS_PHYS         RK3036_CPU_AXI_BUS_PHYS
++#define RK312X_CPU_AXI_BUS_SIZE         RK3036_CPU_AXI_BUS_SIZE
++#define RK312X_GIC_DIST_PHYS            RK3036_GIC_DIST_PHYS
++#define RK312X_GIC_DIST_SIZE            RK3036_GIC_DIST_SIZE
++#define RK312X_GIC_CPU_PHYS             RK3036_GIC_CPU_PHYS
++#define RK312X_GIC_CPU_SIZE             RK3036_GIC_CPU_SIZE
++#define RK312X_CRU_PHYS                 RK3036_CRU_PHYS
++#define RK312X_CRU_SIZE                 RK3036_CRU_SIZE
++#define RK312X_DDR_PCTL_PHYS            RK3036_DDR_PCTL_PHYS
++#define RK312X_DDR_PCTL_SIZE            RK3036_DDR_PCTL_SIZE
++#define RK312X_GRF_PHYS                 RK3036_GRF_PHYS
++#define RK312X_GRF_SIZE                 RK3036_GRF_SIZE
++#define RK312X_DDR_PHY_PHYS             RK3036_DDR_PHY_PHYS
++#define RK312X_DDR_PHY_SIZE             RK3036_DDR_PHY_SIZE
++#define RK312X_TIMER_PHYS               RK3036_TIMER_PHYS
++#define RK312X_TIMER_SIZE               RK3036_TIMER_SIZE
++#define RK312X_UART0_PHYS               RK3036_UART0_PHYS
++#define RK312X_UART1_PHYS               RK3036_UART1_PHYS
++#define RK312X_UART2_PHYS               RK3036_UART2_PHYS
++#define RK312X_UART_SIZE                RK3036_UART_SIZE
++#define RK312X_GPIO0_PHYS               RK3036_GPIO0_PHYS
++#define RK312X_GPIO1_PHYS               RK3036_GPIO1_PHYS
++#define RK312X_GPIO2_PHYS               RK3036_GPIO2_PHYS
++#define RK312X_GPIO3_PHYS               0x20088000
++#define RK312X_GPIO_SIZE                RK3036_GPIO_SIZE
++#define RK312X_EFUSE_PHYS               RK3036_EFUSE_PHYS
++#define RK312X_EFUSE_SIZE               RK3036_EFUSE_SIZE
++#define RK312X_PMU_PHYS			0x100a0000
++#define RK312X_PMU_SIZE			SZ_64K
++#define RK312X_PWM_PHYS			0x20050000
++#define RK312X_PWM_SIZE			SZ_16K
++
++#define RK3228_IMEM_PHYS		RK3036_IMEM_PHYS
++#define RK3228_IMEM_SIZE		SZ_32K
++#define RK3228_ROM_PHYS			RK3036_ROM_PHYS
++#define RK3228_ROM_SIZE			RK3036_ROM_SIZE
++#define RK3228_CPU_AXI_BUS_PHYS		0x31000000
++#define RK3228_CPU_AXI_BUS_SIZE		SZ_32K
++#define RK3228_GIC_DIST_PHYS		0x32011000
++#define RK3228_GIC_DIST_SIZE		SZ_4K
++#define RK3228_GIC_CPU_PHYS		0x32012000
++#define RK3228_GIC_CPU_SIZE		SZ_4K
++#define RK3228_CRU_PHYS			0x110e0000
++#define RK3228_CRU_SIZE			SZ_4K
++#define RK3228_DDR_PCTL_PHYS		0x11200000
++#define RK3228_DDR_PCTL_SIZE		SZ_4K
++#define RK3228_GRF_PHYS			0x11000000
++#define RK3228_GRF_SIZE			SZ_4K
++#define RK3228_SGRF_PHYS		0x10140000
++#define RK3228_SGRF_SIZE		SZ_4K
++#define RK3228_DDR_PHY_PHYS		0x12000000
++#define RK3228_DDR_PHY_SIZE		SZ_4K
++#define RK3228_TIMER_PHYS		0x110c0000
++#define RK3228_TIMER_SIZE		SZ_4K
++#define RK3228_STIMER_PHYS		0x110d0000
++#define RK3228_STIMER_SIZE		SZ_4K
++#define RK3228_UART0_PHYS		0x11010000
++#define RK3228_UART1_PHYS		0x11020000
++#define RK3228_UART2_PHYS		0x11030000
++#define RK3228_UART_SIZE		SZ_4K
++#define RK3228_GPIO0_PHYS		0x11110000
++#define RK3228_GPIO1_PHYS		0x11120000
++#define RK3228_GPIO2_PHYS		0x11130000
++#define RK3228_GPIO3_PHYS		0x11140000
++#define RK3228_GPIO_SIZE		SZ_4K
++#define RK3228_EFUSE_PHYS		0x11040000
++#define RK3228_EFUSE_SIZE		SZ_4K
++#define RK3228_PWM_PHYS			0x110b0000
++#define RK3228_PWM_SIZE			SZ_16K
++
++#endif
+diff --git a/include/linux/rockchip/pmu.h b/include/linux/rockchip/pmu.h
+new file mode 100644
+index 0000000..5f98397
+--- /dev/null
++++ b/include/linux/rockchip/pmu.h
+@@ -0,0 +1,140 @@
++#ifndef __MACH_ROCKCHIP_PMU_H
++#define __MACH_ROCKCHIP_PMU_H
++
++#define RK3188_PMU_WAKEUP_CFG0          0x00
++#define RK3188_PMU_WAKEUP_CFG1          0x04
++#define RK3188_PMU_PWRDN_CON            0x08
++#define RK3188_PMU_PWRDN_ST             0x0c
++#define RK3188_PMU_INT_CON              0x10
++#define RK3188_PMU_INT_ST               0x14
++#define RK3188_PMU_MISC_CON             0x18
++#define RK3188_PMU_OSC_CNT              0x1c
++#define RK3188_PMU_PLL_CNT              0x20
++#define RK3188_PMU_PMU_CNT              0x24
++#define RK3188_PMU_DDRIO_PWRON_CNT      0x28
++#define RK3188_PMU_WAKEUP_RST_CLR_CNT   0x2c
++#define RK3188_PMU_SCU_PWRDWN_CNT       0x30
++#define RK3188_PMU_SCU_PWRUP_CNT        0x34
++#define RK3188_PMU_MISC_CON1            0x38
++#define RK3188_PMU_GPIO0_CON            0x3c
++#define RK3188_PMU_SYS_REG0             0x40
++#define RK3188_PMU_SYS_REG1             0x44
++#define RK3188_PMU_SYS_REG2             0x48
++#define RK3188_PMU_SYS_REG3             0x4c
++#define RK3188_PMU_STOP_INT_DLY         0x60
++#define RK3188_PMU_GPIO0A_PULL          0x64
++#define RK3188_PMU_GPIO0B_PULL          0x68
++
++#define RK3288_PMU_WAKEUP_CFG0          0x00
++#define RK3288_PMU_WAKEUP_CFG1          0x04
++#define RK3288_PMU_PWRDN_CON            0x08
++#define RK3288_PMU_PWRDN_ST             0x0c
++#define RK3288_PMU_IDLE_REQ             0x10
++#define RK3288_PMU_IDLE_ST              0x14
++#define RK3288_PMU_PWRMODE_CON          0x18
++#define RK3288_PMU_PWR_STATE            0x1c
++#define RK3288_PMU_OSC_CNT              0x20
++#define RK3288_PMU_PLL_CNT              0x24
++#define RK3288_PMU_STABL_CNT            0x28
++#define RK3288_PMU_DDR0IO_PWRON_CNT     0x2c
++#define RK3288_PMU_DDR1IO_PWRON_CNT     0x30
++#define RK3288_PMU_CORE_PWRDWN_CNT      0x34
++#define RK3288_PMU_CORE_PWRUP_CNT       0x38
++#define RK3288_PMU_GPU_PWRDWN_CNT       0x3c
++#define RK3288_PMU_GPU_PWRUP_CNT        0x40
++#define RK3288_PMU_WAKEUP_RST_CLR_CNT   0x44
++#define RK3288_PMU_SFT_CON              0x48
++#define RK3288_PMU_DDR_SREF_ST          0x4c
++#define RK3288_PMU_INT_CON              0x50
++#define RK3288_PMU_INT_ST               0x54
++#define RK3288_PMU_BOOT_ADDR_SEL        0x58
++#define RK3288_PMU_GRF_CON              0x5c
++#define RK3288_PMU_GPIO_SR              0x60
++#define RK3288_PMU_GPIO0_A_PULL         0x64
++#define RK3288_PMU_GPIO0_B_PULL         0x68
++#define RK3288_PMU_GPIO0_C_PULL         0x6c
++#define RK3288_PMU_GPIO0_A_DRV          0x70
++#define RK3288_PMU_GPIO0_B_DRV          0x74
++#define RK3288_PMU_GPIO0_C_DRV          0x78
++#define RK3288_PMU_GPIO_OP              0x7c
++#define RK3288_PMU_GPIO0_SEL18          0x80
++#define RK3288_PMU_GPIO0_A_IOMUX        0x84
++#define RK3288_PMU_GPIO0_B_IOMUX        0x88
++#define RK3288_PMU_GPIO0_C_IOMUX        0x8c
++#define RK3288_PMU_PWRMODE_CON1        0x90
++#define RK3288_PMU_SYS_REG0             0x94
++#define RK3288_PMU_SYS_REG1             0x98
++#define RK3288_PMU_SYS_REG2             0x9c
++#define RK3288_PMU_SYS_REG3             0xa0
++
++#define RK312X_PMU_WAKEUP_CFG		0x00
++#define RK312X_PMU_PWRDN_CON			0x04
++#define RK312X_PMU_PWRDN_ST			0x08
++#define RK312X_PMU_IDLE_REQ			0x0C
++#define RK312X_PMU_IDLE_ST				0x10
++#define RK312X_PMU_PWRMODE_CON		0x14
++#define RK312X_PMU_PWR_STATE			0x18
++#define RK312X_PMU_OSC_CNT			0x1C
++#define RK312X_PMU_CORE_PWRDWN_CNT	0x20
++#define RK312X_PMU_CORE_PWRUP_CNT	0x24
++#define RK312X_PMU_SFT_CON			0x28
++#define RK312X_PMU_DDR_SREF_ST		0x2C
++#define RK312X_PMU_INT_CON			0x30
++#define RK312X_PMU_INT_ST				0x34
++#define RK312X_PMU_SYS_REG0			0x38
++#define RK312X_PMU_SYS_REG1			0x3C
++#define RK312X_PMU_SYS_REG2			0x40
++#define RK312X_PMU_SYS_REG3			0x44
++
++#define RK3368_PMU_PWRDN_CON		0x0c
++#define RK3368_PMU_PWRDN_ST		0x10
++#define RK3368_PMU_IDLE_REQ		0x3c
++#define RK3368_PMU_IDLE_ST		0x40
++
++enum pmu_power_domain {
++	PD_BCPU,
++	PD_BDSP,
++	PD_BUS,
++	PD_CPU_0,
++	PD_CPU_1,
++	PD_CPU_2,
++	PD_CPU_3,
++	PD_CS,
++	PD_GPU,
++	PD_HEVC,
++	PD_PERI,
++	PD_SCU,
++	PD_VIDEO,
++	PD_VIO,
++	PD_GPU_0,
++	PD_GPU_1,
++};
++
++enum pmu_idle_req {
++	IDLE_REQ_ALIVE,
++	IDLE_REQ_AP2BP,
++	IDLE_REQ_BP2AP,
++	IDLE_REQ_BUS,
++	IDLE_REQ_CORE,
++	IDLE_REQ_CPUP,
++	IDLE_REQ_DMA,
++	IDLE_REQ_GPU,
++	IDLE_REQ_HEVC,
++	IDLE_REQ_PERI,
++	IDLE_REQ_VIDEO,
++	IDLE_REQ_VIO,
++	IDLE_REQ_SYS,
++	IDLE_REQ_MSCH,
++	IDLE_REQ_CRYPTO,
++};
++
++struct rockchip_pmu_operations {
++	int (*set_power_domain)(enum pmu_power_domain pd, bool on);
++	bool (*power_domain_is_on)(enum pmu_power_domain pd);
++	int (*set_idle_request)(enum pmu_idle_req req, bool idle);
++};
++
++int rockchip_pmu_idle_request(struct device *dev, bool idle);
++extern struct rockchip_pmu_operations rockchip_pmu_ops;
++
++#endif
+diff --git a/include/linux/rockchip/psci.h b/include/linux/rockchip/psci.h
+new file mode 100644
+index 0000000..7a3eed6
+--- /dev/null
++++ b/include/linux/rockchip/psci.h
+@@ -0,0 +1,75 @@
++#ifndef __ROCKCHIP_PSCI_H
++#define __ROCKCHIP_PSCI_H
++
++#define SEC_REG_RD (0x0)
++#define SEC_REG_WR (0x1)
++
++/*
++ * trust firmware verison
++ */
++#define RKTF_VER_MAJOR(ver)		(((ver) >> 16) & 0xffff)
++#define RKTF_VER_MINOR(ver)		((ver) & 0xffff)
++
++/*
++ * pcsi smc funciton id
++ */
++#define PSCI_SIP_RKTF_VER		(0x82000001)
++#define PSCI_SIP_ACCESS_REG		(0x82000002)
++#define PSCI_SIP_ACCESS_REG64		(0xc2000002)
++#define PSCI_SIP_SUSPEND_WR_CTRBITS	(0x82000003)
++#define PSCI_SIP_PENDING_CPUS		(0x82000004)
++#define PSCI_SIP_UARTDBG_CFG		(0x82000005)
++#define PSCI_SIP_UARTDBG_CFG64		(0xc2000005)
++#define PSCI_SIP_EL3FIQ_CFG		(0x82000006)
++#define PSCI_SIP_SMEM_CONFIG		(0x82000007)
++
++/*
++ * pcsi smc funciton err code
++ */
++#define PSCI_SMC_FUNC_UNK		0xffffffff
++
++/*
++ * define PSCI_SIP_UARTDBG_CFG call type
++ */
++#define UARTDBG_CFG_INIT		0xf0
++#define UARTDBG_CFG_OSHDL_TO_OS		0xf1
++#define UARTDBG_CFG_OSHDL_CPUSW		0xf3
++#define UARTDBG_CFG_OSHDL_DEBUG_ENABLE	0xf4
++#define UARTDBG_CFG_OSHDL_DEBUG_DISABLE	0xf5
++
++/*
++ * rockchip psci function call interface
++ */
++
++u32 rockchip_psci_smc_read(u32 function_id, u32 arg0, u32 arg1, u32 arg2,
++			   u32 *val);
++u32 rockchip_psci_smc_write(u32 function_id, u32 arg0, u32 arg1, u32 arg2);
++
++u32 rockchip_psci_smc_get_tf_ver(void);
++u32 rockchip_secure_reg_read(u32 addr_phy);
++u32 rockchip_secure_reg_write(u32 addr_phy, u32 val);
++
++#ifdef CONFIG_ARM64
++u32 rockchip_psci_smc_write64(u64 function_id, u64 arg0, u64 arg1, u64 arg2);
++u32 rockchip_psci_smc_read64(u64 function_id, u64 arg0, u64 arg1, u64 arg2,
++			     u64 *val);
++u64 rockchip_secure_reg_read64(u64 addr_phy);
++u32 rockchip_secure_reg_write64(u64 addr_phy, u64 val);
++
++void psci_fiq_debugger_uart_irq_tf_cb(u64 sp_el1, u64 offset);
++#endif
++
++u32 psci_fiq_debugger_switch_cpu(u32 cpu);
++void psci_fiq_debugger_uart_irq_tf_init(u32 irq_id, void *callback);
++void psci_fiq_debugger_enable_debug(bool val);
++
++#if defined(CONFIG_ARM_PSCI) || defined(CONFIG_ARM64)
++u32 psci_set_memory_secure(bool val);
++#else
++static inline u32 psci_set_memory_secure(bool val)
++{
++	return 0;
++}
++#endif
++
++#endif /* __ROCKCHIP_PSCI_H */
+diff --git a/include/linux/rockchip/scpi.h b/include/linux/rockchip/scpi.h
+new file mode 100644
+index 0000000..c57df97
+--- /dev/null
++++ b/include/linux/rockchip/scpi.h
+@@ -0,0 +1,53 @@
++/*
++ * SCPI Message Protocol driver header
++ *
++ * Copyright (C) 2014 ARM Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/types.h>
++#include <linux/rockchip/common.h>
++
++struct scpi_opp_entry {
++	u32 freq_hz;
++	u32 volt_mv;
++} __packed;
++
++struct scpi_opp {
++	struct scpi_opp_entry *opp;
++	u32 latency; /* in usecs */
++	int count;
++} __packed;
++
++unsigned long scpi_clk_get_val(u16 clk_id);
++int scpi_clk_set_val(u16 clk_id, unsigned long rate);
++int scpi_dvfs_get_idx(u8 domain);
++int scpi_dvfs_set_idx(u8 domain, u8 idx);
++struct scpi_opp *scpi_dvfs_get_opps(u8 domain);
++int scpi_get_sensor(char *name);
++int scpi_get_sensor_value(u16 sensor, u32 *val);
++
++int scpi_sys_set_mcu_state_suspend(void);
++int scpi_sys_set_mcu_state_resume(void);
++
++int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type,
++		  u32 addr_mcu_el3);
++int scpi_ddr_set_clk_rate(u32 rate, u32 lcdc_type);
++int scpi_ddr_send_timing(u32 *p, u32 size);
++int scpi_ddr_round_rate(u32 m_hz);
++int scpi_ddr_set_auto_self_refresh(u32 en);
++int scpi_ddr_bandwidth_get(struct ddr_bw_info *ddr_bw_ch0,
++			   struct ddr_bw_info *ddr_bw_ch1);
++int scpi_ddr_get_clk_rate(void);
++int scpi_thermal_get_temperature(void);
++int scpi_thermal_set_clk_cycle(u32 cycle);
+diff --git a/include/linux/wakelock.h b/include/linux/wakelock.h
+new file mode 100644
+index 0000000..f4a698a
+--- /dev/null
++++ b/include/linux/wakelock.h
+@@ -0,0 +1,67 @@
++/* include/linux/wakelock.h
++ *
++ * Copyright (C) 2007-2012 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _LINUX_WAKELOCK_H
++#define _LINUX_WAKELOCK_H
++
++#include <linux/ktime.h>
++#include <linux/device.h>
++
++/* A wake_lock prevents the system from entering suspend or other low power
++ * states when active. If the type is set to WAKE_LOCK_SUSPEND, the wake_lock
++ * prevents a full system suspend.
++ */
++
++enum {
++	WAKE_LOCK_SUSPEND, /* Prevent suspend */
++	WAKE_LOCK_TYPE_COUNT
++};
++
++struct wake_lock {
++	struct wakeup_source ws;
++};
++
++static inline void wake_lock_init(struct wake_lock *lock, int type,
++				  const char *name)
++{
++	wakeup_source_init(&lock->ws, name);
++}
++
++static inline void wake_lock_destroy(struct wake_lock *lock)
++{
++	wakeup_source_trash(&lock->ws);
++}
++
++static inline void wake_lock(struct wake_lock *lock)
++{
++	__pm_stay_awake(&lock->ws);
++}
++
++static inline void wake_lock_timeout(struct wake_lock *lock, long timeout)
++{
++	__pm_wakeup_event(&lock->ws, jiffies_to_msecs(timeout));
++}
++
++static inline void wake_unlock(struct wake_lock *lock)
++{
++	__pm_relax(&lock->ws);
++}
++
++static inline int wake_lock_active(struct wake_lock *lock)
++{
++	return lock->ws.active;
++}
++
++#endif
