@@ -24,13 +24,13 @@ Supported build environments:
 - Preemption
 - HDMI
 - Gigabit Ethernet
+- WiFi
 - USB
+- Rebooting
 
 ### What doesn't work
 
-- Wifi
 - Bluetooth
-- Reboot
 
 ### What wasn't testet
 
