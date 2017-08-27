@@ -1,0 +1,2936 @@
+diff --git a/drivers/spi/spi-rk.c b/drivers/spi/spi-rk.c
+new file mode 100644
+index 0000000..257319b
+--- /dev/null
++++ b/drivers/spi/spi-rk.c
+@@ -0,0 +1,349 @@
++/*
++ * rockchip spi interface driver for DW SPI Core
++ *
++ * Copyright (c) 2014, ROCKCHIP Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <linux/interrupt.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/workqueue.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/clk.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/spi/spi.h>
++#include <linux/gpio.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <linux/platform_data/spi-rockchip.h>
++
++#include "spi-rockchip-core.h"
++
++
++#define DRIVER_NAME "rockchip_spi_driver_data"
++#define SPI_MAX_FREQUENCY	24000000
++
++struct rockchip_spi_driver_data {
++	struct platform_device *pdev;
++	struct dw_spi	dws;
++	struct rockchip_spi_info *info;
++	struct clk                      *clk_spi;
++	struct clk                      *pclk_spi;
++};
++
++#ifdef CONFIG_OF
++static struct rockchip_spi_info *rockchip_spi_parse_dt(struct device *dev)
++{
++	struct rockchip_spi_info *info;
++	u32 temp;
++
++	info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
++	if (!info) {
++		dev_err(dev, "memory allocation for spi_info failed\n");
++		return ERR_PTR(-ENOMEM);
++	}
++
++	if (of_property_read_u32(dev->of_node, "rockchip,spi-src-clk", &temp)) {
++		dev_warn(dev, "spi bus clock parent not specified, using clock at index 0 as parent\n");
++		info->src_clk_nr = 0;
++	} else {
++		info->src_clk_nr = temp;
++	}
++#if 0
++	if (of_property_read_u32(dev->of_node, "bus-num", &temp)) {
++		dev_warn(dev, "number of bus not specified, assuming bus 0\n");
++		info->bus_num= 0;
++	} else {
++		info->bus_num = temp;
++	}
++#endif
++	if (of_property_read_u32(dev->of_node, "num-cs", &temp)) {
++		dev_warn(dev, "number of chip select lines not specified, assuming 1 chip select line\n");
++		info->num_cs = 1;
++	} else {
++		info->num_cs = temp;
++	}
++
++	if (of_property_read_u32(dev->of_node, "max-freq", &temp)) {
++		dev_warn(dev, "fail to get max-freq,default set %dHZ\n",SPI_MAX_FREQUENCY);
++		info->spi_freq = SPI_MAX_FREQUENCY;
++	} else {
++		info->spi_freq = temp;
++	}
++	
++	//printk("%s:line=%d,src_clk_nr=%d,bus_num=%d,num_cs=%d\n",__func__, __LINE__,info->src_clk_nr,info->bus_num,info->num_cs);
++	
++	return info;
++}
++#else
++static struct rockchip_spi_info *rockchip_spi_parse_dt(struct device *dev)
++{
++	return dev->platform_data;
++}
++#endif
++
++
++static int rockchip_spi_probe(struct platform_device *pdev)
++{
++	struct resource	*mem_res;
++	struct rockchip_spi_driver_data *sdd;
++	struct rockchip_spi_info *info = pdev->dev.platform_data;
++	struct dw_spi *dws;
++	int ret, irq;
++	char clk_name[16];
++
++	if (!info && pdev->dev.of_node) {
++		info = rockchip_spi_parse_dt(&pdev->dev);
++		if (IS_ERR(info))
++			return PTR_ERR(info);
++	}
++
++	if (!info) {
++		dev_err(&pdev->dev, "platform_data missing!\n");
++		return -ENODEV;
++	}	
++
++	sdd = kzalloc(sizeof(struct rockchip_spi_driver_data), GFP_KERNEL);
++	if (!sdd) {
++		ret = -ENOMEM;
++		goto err_kfree;
++	}
++
++	
++	sdd->pdev = pdev;
++	sdd->info = info;
++	dws = &sdd->dws;
++
++	atomic_set(&dws->debug_flag, 0);//debug flag
++
++	/* Get basic io resource and map it */
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		dev_warn(&pdev->dev, "Failed to get IRQ: %d\n", irq);
++		return irq;
++	}
++	
++	mem_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (mem_res == NULL) {
++		dev_err(&pdev->dev, "Unable to get SPI MEM resource\n");
++		ret =  -ENXIO;
++		goto err_unmap;
++	}
++	
++	dws->regs = ioremap(mem_res->start, (mem_res->end - mem_res->start) + 1);
++	if (!dws->regs){
++		ret = -EBUSY;
++		goto err_unmap;
++	}
++
++	dws->paddr = mem_res->start;
++	dws->iolen = (mem_res->end - mem_res->start) + 1;
++	
++	printk(KERN_INFO "dws->regs: %p\n", dws->regs);
++
++	//get bus num
++	if (pdev->dev.of_node) {
++		ret = of_alias_get_id(pdev->dev.of_node, "spi");
++		if (ret < 0) {
++			dev_err(&pdev->dev, "failed to get alias id, errno %d\n",
++				ret);
++			goto err_release_mem;
++		}
++		info->bus_num = ret;
++	} else {
++		info->bus_num = pdev->id;
++	}
++
++	/* Setup clocks */
++	sdd->clk_spi = devm_clk_get(&pdev->dev, "spi");
++	if (IS_ERR(sdd->clk_spi)) {
++		dev_err(&pdev->dev, "Unable to acquire clock 'spi'\n");
++		ret = PTR_ERR(sdd->clk_spi);
++		goto err_clk;
++	}
++
++	if (clk_prepare_enable(sdd->clk_spi)) {
++		dev_err(&pdev->dev, "Couldn't enable clock 'spi'\n");
++		ret = -EBUSY;
++		goto err_clk;
++	}
++	
++	sprintf(clk_name, "pclk_spi%d", info->src_clk_nr);
++	sdd->pclk_spi = devm_clk_get(&pdev->dev, clk_name);
++	if (IS_ERR(sdd->pclk_spi)) {
++		dev_err(&pdev->dev,
++			"Unable to acquire clock '%s'\n", clk_name);
++		ret = PTR_ERR(sdd->pclk_spi);
++		goto err_pclk;
++	}
++
++	if (clk_prepare_enable(sdd->pclk_spi)) {
++		dev_err(&pdev->dev, "Couldn't enable clock '%s'\n", clk_name);
++		ret = -EBUSY;
++		goto err_pclk;
++	}
++
++	clk_set_rate(sdd->clk_spi, info->spi_freq);
++	
++	dws->max_freq = clk_get_rate(sdd->clk_spi);
++	dws->parent_dev = &pdev->dev;
++	dws->bus_num = info->bus_num;
++	dws->num_cs = info->num_cs;
++	dws->irq = irq;
++	dws->clk_spi = sdd->clk_spi;	
++	dws->pclk_spi = sdd->pclk_spi;
++
++	/*
++	 * handling for rockchip paltforms, like dma setup,
++	 * clock rate, FIFO depth.
++	 */
++	
++#ifdef CONFIG_SPI_ROCKCHIP_DMA
++	ret = dw_spi_dma_init(dws);
++	if (ret)
++	printk("%s:fail to init dma\n",__func__);
++#endif
++
++	ret = dw_spi_add_host(dws);
++	if (ret)
++		goto err_release_mem;
++
++	platform_set_drvdata(pdev, sdd);
++
++	printk("%s:num_cs=%d,bus_num=%d,irq=%d,freq=%d ok\n",__func__, info->num_cs, info->bus_num, irq, dws->max_freq);
++	
++	return 0;
++err_release_mem:
++    release_mem_region(mem_res->start, (mem_res->end - mem_res->start) + 1);
++err_pclk:
++	clk_disable_unprepare(sdd->pclk_spi);
++err_clk:
++	clk_disable_unprepare(sdd->clk_spi);
++err_unmap:
++	iounmap(dws->regs);
++err_kfree:
++	kfree(sdd);
++	return ret;
++}
++
++static int rockchip_spi_remove(struct platform_device *pdev)
++{
++	struct rockchip_spi_driver_data *sdd = platform_get_drvdata(pdev);
++	
++	platform_set_drvdata(pdev, NULL);
++	dw_spi_remove_host(&sdd->dws);
++	iounmap(sdd->dws.regs);
++	kfree(sdd);
++
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int rockchip_spi_suspend(struct device *dev)
++{
++	struct rockchip_spi_driver_data *sdd = dev_get_drvdata(dev);
++	int ret = 0;
++	
++	ret = dw_spi_suspend_host(&sdd->dws);
++	
++	return ret;
++}
++
++static int rockchip_spi_resume(struct device *dev)
++{
++	struct rockchip_spi_driver_data *sdd = dev_get_drvdata(dev);
++	int ret = 0;
++	
++	ret = dw_spi_resume_host(&sdd->dws);	
++
++	return ret;
++}
++#endif /* CONFIG_PM_SLEEP */
++
++#ifdef CONFIG_PM_RUNTIME
++static int rockchip_spi_runtime_suspend(struct device *dev)
++{
++	struct rockchip_spi_driver_data *sdd = dev_get_drvdata(dev);
++	struct dw_spi *dws = &sdd->dws;
++	
++	clk_disable_unprepare(sdd->clk_spi);
++	clk_disable_unprepare(sdd->pclk_spi);
++
++	
++	DBG_SPI("%s\n",__func__);
++	
++	return 0;
++}
++
++static int rockchip_spi_runtime_resume(struct device *dev)
++{
++	struct rockchip_spi_driver_data *sdd = dev_get_drvdata(dev);
++	struct dw_spi *dws = &sdd->dws;
++
++	clk_prepare_enable(sdd->pclk_spi);
++	clk_prepare_enable(sdd->clk_spi);
++	
++	DBG_SPI("%s\n",__func__);
++	return 0;
++}
++#endif /* CONFIG_PM_RUNTIME */
++
++static const struct dev_pm_ops rockchip_spi_pm = {
++	SET_SYSTEM_SLEEP_PM_OPS(rockchip_spi_suspend, rockchip_spi_resume)
++	SET_RUNTIME_PM_OPS(rockchip_spi_runtime_suspend,
++			   rockchip_spi_runtime_resume, NULL)
++};
++
++#ifdef CONFIG_OF
++static const struct of_device_id rockchip_spi_dt_match[] = {
++	{ .compatible = "rockchip,rockchip-spi",
++	},
++	{ },
++};
++MODULE_DEVICE_TABLE(of, rockchip_spi_dt_match);
++#endif /* CONFIG_OF */
++
++static struct platform_driver rockchip_spi_driver = {
++	.driver = {
++		.name	= "rockchip-spi",
++		.owner = THIS_MODULE,
++		.pm = &rockchip_spi_pm,
++		.of_match_table = of_match_ptr(rockchip_spi_dt_match),
++	},
++	.remove = rockchip_spi_remove,
++};
++MODULE_ALIAS("platform:rockchip-spi");
++
++static int __init rockchip_spi_init(void)
++{
++	return platform_driver_probe(&rockchip_spi_driver, rockchip_spi_probe);
++}
++module_init(rockchip_spi_init);
++
++static void __exit rockchip_spi_exit(void)
++{
++	platform_driver_unregister(&rockchip_spi_driver);
++}
++module_exit(rockchip_spi_exit);
++
++MODULE_AUTHOR("Luo Wei <lw@rock-chips.com>");
++MODULE_DESCRIPTION("ROCKCHIP SPI Controller Driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/spi/spi-rockchip-core.c b/drivers/spi/spi-rockchip-core.c
+new file mode 100755
+index 0000000..dbe542c
+--- /dev/null
++++ b/drivers/spi/spi-rockchip-core.c
+@@ -0,0 +1,1134 @@
++/*
++ * Designware SPI core controller driver (refer spi_dw.c)
++ *
++ * Copyright (c) 2009, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/highmem.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/clk.h>
++
++
++#include "spi-rockchip-core.h"
++
++#ifdef CONFIG_DEBUG_FS
++#include <linux/debugfs.h>
++#endif
++
++#define START_STATE	((void *)0)
++#define RUNNING_STATE	((void *)1)
++#define DONE_STATE	((void *)2)
++#define ERROR_STATE	((void *)-1)
++
++#define QUEUE_RUNNING	0
++#define QUEUE_STOPPED	1
++
++#define MRST_SPI_DEASSERT	0
++#define MRST_SPI_ASSERT		1
++
++
++/* Slave spi_dev related */
++struct chip_data {
++	u16 cr0;
++	u8 cs;			/* chip select pin */
++	u8 n_bytes;		/* current is a 1/2/4 byte op */
++	u8 tmode;		/* TR/TO/RO/EEPROM */
++	u8 type;		/* SPI/SSP/MicroWire */
++
++	u8 poll_mode;		/* 1 means use poll mode */
++	
++	u8 slave_enable;
++	u32 dma_width;
++	u32 rx_threshold;
++	u32 tx_threshold;
++	u8 enable_dma;
++	u8 bits_per_word;
++	u16 clk_div;		/* baud rate divider */
++	u32 speed_hz;		/* baud rate */
++	void (*cs_control)(struct dw_spi *dws, u32 cs, u8 flag);
++};
++
++#ifdef CONFIG_DEBUG_FS
++#define SPI_REGS_BUFSIZE	1024
++
++static ssize_t spi_write_proc_data(struct file *file, const char __user *buffer,
++			   size_t count, loff_t *data)
++{	
++	struct dw_spi *dws;
++	char *buf;
++	ssize_t ret;
++	int reg = 0,value = 0;
++	
++	dws = file->private_data;
++
++	buf = kzalloc(32, GFP_KERNEL);
++	if (!buf)
++	return 0;
++	
++	ret = copy_from_user(buf, buffer, count);
++	if (ret)
++	{
++		return ret; 
++	}
++
++	if((strstr(buf, "debug") != NULL) || (strstr(buf, "DEBUG") != NULL))
++	{		
++		atomic_set(&dws->debug_flag, 1);		
++		kfree(buf);
++		printk("%s:open debug\n",__func__);
++		return count;
++	}
++	else if((strstr(buf, "stop") != NULL) || (strstr(buf, "STOP") != NULL))
++	{		
++		atomic_set(&dws->debug_flag, 0);
++		printk("%s:close debug\n",__func__);
++	}
++	else if((strstr(buf, "=") != NULL))
++	{
++		printk("%s:invalid command\n",__func__);	
++		return count;
++	}
++
++	sscanf(buf, "0x%x=0x%x", &reg, &value);
++
++	if((reg >= SPIM_CTRLR0) && (reg <= SPIM_DMARDLR))	
++	{
++		dw_writew(dws, reg, value);
++		printk("%s:write data[0x%x] to reg[0x%x] succesfully\n",__func__, value, reg);
++	}
++	else
++	{
++		printk("%s:data[0x%x] or reg[0x%x] is out of range\n",__func__, value, reg);
++	}
++	
++	kfree(buf);
++		
++	return count; 
++}
++
++static ssize_t  spi_show_regs(struct file *file, char __user *user_buf,
++				size_t count, loff_t *ppos)
++{
++	struct dw_spi *dws;
++	char *buf;
++	u32 len = 0;
++	ssize_t ret;
++
++	dws = file->private_data;
++
++	buf = kzalloc(SPI_REGS_BUFSIZE, GFP_KERNEL);
++	if (!buf)
++		return 0;
++
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"MRST SPI0 registers:\n");
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"=================================\n");
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"CTRL0: \t\t0x%08x\n", dw_readl(dws, SPIM_CTRLR0));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"CTRL1: \t\t0x%08x\n", dw_readl(dws, SPIM_CTRLR1));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"SSIENR: \t0x%08x\n", dw_readl(dws, SPIM_SSIENR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"SER: \t\t0x%08x\n", dw_readl(dws, SPIM_SER));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"BAUDR: \t\t0x%08x\n", dw_readl(dws, SPIM_BAUDR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"TXFTLR: \t0x%08x\n", dw_readl(dws, SPIM_TXFTLR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"RXFTLR: \t0x%08x\n", dw_readl(dws, SPIM_RXFTLR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"TXFLR: \t\t0x%08x\n", dw_readl(dws, SPIM_TXFLR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"RXFLR: \t\t0x%08x\n", dw_readl(dws, SPIM_RXFLR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"SR: \t\t0x%08x\n", dw_readl(dws, SPIM_SR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"IMR: \t\t0x%08x\n", dw_readl(dws, SPIM_IMR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"ISR: \t\t0x%08x\n", dw_readl(dws, SPIM_ISR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"DMACR: \t\t0x%08x\n", dw_readl(dws, SPIM_DMACR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"DMATDLR: \t0x%08x\n", dw_readl(dws, SPIM_DMATDLR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"DMARDLR: \t0x%08x\n", dw_readl(dws, SPIM_DMARDLR));
++	len += snprintf(buf + len, SPI_REGS_BUFSIZE - len,
++			"=================================\n");
++
++	ret =  simple_read_from_buffer(user_buf, count, ppos, buf, len);
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations spi_regs_ops = {
++	.owner		= THIS_MODULE,
++	.open		= simple_open,
++	.read		= spi_show_regs,
++	.write		= spi_write_proc_data,
++	.llseek		= default_llseek,
++};
++
++static int spi_debugfs_init(struct dw_spi *dws)
++{
++	dws->debugfs = debugfs_create_dir("spi", NULL);
++	if (!dws->debugfs)
++		return -ENOMEM;
++
++	debugfs_create_file("registers", S_IFREG | S_IRUGO,
++		dws->debugfs, (void *)dws, &spi_regs_ops);
++	return 0;
++}
++
++static void spi_debugfs_remove(struct dw_spi *dws)
++{
++	if (dws->debugfs)
++		debugfs_remove_recursive(dws->debugfs);
++}
++
++#else
++static inline int spi_debugfs_init(struct dw_spi *dws)
++{
++	return 0;
++}
++
++static inline void spi_debugfs_remove(struct dw_spi *dws)
++{
++}
++#endif /* CONFIG_DEBUG_FS */
++
++
++static void wait_till_not_busy(struct dw_spi *dws)
++{
++	unsigned long end = jiffies + 1 + usecs_to_jiffies(1000);
++	//if spi was slave, it is SR_BUSY always.  
++	if(dws->cur_chip) {
++		if(dws->cur_chip->slave_enable == 1)
++			return;
++	}
++	
++	while (time_before(jiffies, end)) {
++		if (!(dw_readw(dws, SPIM_SR) & SR_BUSY))
++			return;
++	}
++	dev_err(&dws->master->dev,
++		"DW SPI: Status keeps busy for 1000us after a read/write!\n");
++}
++
++
++static void flush(struct dw_spi *dws)
++{
++	while (!(dw_readw(dws, SPIM_SR) & SR_RF_EMPT))
++		dw_readw(dws, SPIM_RXDR);
++
++	wait_till_not_busy(dws);
++}
++
++
++/* Return the max entries we can fill into tx fifo */
++static inline u32 tx_max(struct dw_spi *dws)
++{
++	u32 tx_left, tx_room;
++
++	tx_left = (dws->tx_end - dws->tx) / dws->n_bytes;
++	tx_room = dws->fifo_len - dw_readw(dws, SPIM_TXFLR);
++
++	/*
++	 * Another concern is about the tx/rx mismatch, we
++	 * though to use (dws->fifo_len - rxflr - txflr) as
++	 * one maximum value for tx, but it doesn't cover the
++	 * data which is out of tx/rx fifo and inside the
++	 * shift registers. So a control from sw point of
++	 * view is taken.
++	 */
++	//rxtx_gap =  ((dws->rx_end - dws->rx) - (dws->tx_end - dws->tx))
++	//		/ dws->n_bytes;
++
++	return min(tx_left, tx_room);
++}
++
++/* Return the max entries we should read out of rx fifo */
++static inline u32 rx_max(struct dw_spi *dws)
++{
++	u32 rx_left = (dws->rx_end - dws->rx) / dws->n_bytes;
++
++	return min(rx_left, (u32)dw_readw(dws, SPIM_RXFLR));
++}
++
++static void dw_writer(struct dw_spi *dws)
++{
++	u32 max = tx_max(dws);
++	u16 txw = 0;	
++	
++	DBG_SPI("%dbyte tx:",dws->n_bytes);
++	while (max--) {
++		/* Set the tx word if the transfer's original "tx" is not null */
++		if (dws->tx_end - dws->len) {
++			if (dws->n_bytes == 1)
++			{
++				txw = *(u8 *)(dws->tx);	
++				DBG_SPI("0x%02x,", *(u8 *)(dws->tx));
++			}
++			else
++			{
++				txw = *(u16 *)(dws->tx);
++				DBG_SPI("0x%02x,", *(u16 *)(dws->tx));
++			}
++		}
++		dw_writew(dws, SPIM_TXDR, txw);
++		dws->tx += dws->n_bytes;
++	}
++	
++	//it is neccessary
++	wait_till_not_busy(dws);
++	
++	DBG_SPI("\n");
++}
++
++static void dw_reader(struct dw_spi *dws)
++{
++	u32 max = rx_max(dws);
++	u16 rxw;
++	
++	DBG_SPI("%dbyte rx:",dws->n_bytes);
++
++	while (max--) {
++		rxw = dw_readw(dws, SPIM_RXDR);
++		/* Care rx only if the transfer's original "rx" is not null */
++		if (dws->rx_end - dws->len) {
++			if (dws->n_bytes == 1)
++			{
++				*(u8 *)(dws->rx) = rxw;
++				DBG_SPI("0x%02x,", *(u8 *)(dws->rx));
++			}
++			else
++			{
++				*(u16 *)(dws->rx) = rxw;
++				DBG_SPI("0x%02x,", *(u16 *)(dws->rx));
++			}
++		}
++		
++		dws->rx += dws->n_bytes;
++	}
++	
++	DBG_SPI("\n");
++}
++
++static int reader_all(struct dw_spi *dws)
++{
++	while (!(dw_readw(dws, SPIM_SR) & SR_RF_EMPT)
++		&& (dws->rx < dws->rx_end)) {
++			dw_reader(dws);		
++			wait_till_not_busy(dws);
++		}
++
++	return dws->rx == dws->rx_end;
++}
++
++
++static void *next_transfer(struct dw_spi *dws)
++{
++	struct spi_message *msg = dws->cur_msg;
++	struct spi_transfer *trans = dws->cur_transfer;
++
++	/* Move to next transfer */
++	if (trans->transfer_list.next != &msg->transfers) {
++		dws->cur_transfer =
++			list_entry(trans->transfer_list.next,
++					struct spi_transfer,
++					transfer_list);
++		return RUNNING_STATE;
++	} else
++		return DONE_STATE;
++}
++
++/*
++ * Note: first step is the protocol driver prepares
++ * a dma-capable memory, and this func just need translate
++ * the virt addr to physical
++ */
++static int map_dma_buffers(struct dw_spi *dws)
++{
++	if (!dws->dma_inited
++		|| !dws->cur_chip->enable_dma
++		|| !dws->dma_ops)
++		return 0;
++
++	if (dws->cur_transfer->tx_dma)
++		dws->tx_dma = dws->cur_transfer->tx_dma;
++
++	if (dws->cur_transfer->rx_dma)
++		dws->rx_dma = dws->cur_transfer->rx_dma;
++	
++	DBG_SPI("%s:line=%d\n",__func__,__LINE__);
++	return 1;
++}
++
++/* Caller already set message->status; dma and pio irqs are blocked */
++static void giveback(struct dw_spi *dws)
++{
++	struct spi_transfer *last_transfer;
++	unsigned long flags;
++	struct spi_message *msg;	
++	struct spi_message *next_msg;
++	
++	spin_lock_irqsave(&dws->lock, flags);
++	msg = dws->cur_msg;
++	dws->cur_msg = NULL;
++	dws->cur_transfer = NULL;
++	dws->prev_chip = dws->cur_chip;
++	dws->cur_chip = NULL;
++	dws->dma_mapped = 0;
++	dws->state = 0;
++	//queue_work(dws->workqueue, &dws->pump_messages);
++
++	/*it is important to close intterrupt*/
++	spi_mask_intr(dws, 0xff);
++	//rk29xx_writew(dws, SPIM_DMACR, 0);
++	
++	spin_unlock_irqrestore(&dws->lock, flags);
++
++	last_transfer = list_entry(msg->transfers.prev,
++					struct spi_transfer,
++					transfer_list);
++
++	if (!last_transfer->cs_change && dws->cs_control)
++		dws->cs_control(dws, msg->spi->chip_select, MRST_SPI_DEASSERT);
++
++	msg->state = NULL;
++
++	/* get a pointer to the next message, if any */
++	next_msg = spi_get_next_queued_message(dws->master);
++
++	/* see if the next and current messages point
++	* to the same chip
++	*/
++	if (next_msg && next_msg->spi != msg->spi)
++	next_msg = NULL;
++	
++	dws->cur_chip = NULL;
++	spi_finalize_current_message(dws->master);
++	
++	DBG_SPI("%s:line=%d,tx_left=%ld\n",__func__,__LINE__, (long)(dws->tx_end - dws->tx) / dws->n_bytes);
++}
++
++
++static void int_error_stop(struct dw_spi *dws, const char *msg)
++{
++	/* Stop the hw */
++	flush(dws);
++	spi_enable_chip(dws, 0);
++
++	dev_err(&dws->master->dev, "%s\n", msg);
++	dws->cur_msg->state = ERROR_STATE;
++	tasklet_schedule(&dws->pump_transfers);	
++	DBG_SPI("%s:line=%d\n",__func__,__LINE__);
++}
++
++void dw_spi_xfer_done(struct dw_spi *dws)
++{
++	/* Update total byte transferred return count actual bytes read */
++	dws->cur_msg->actual_length += dws->len;
++
++	/* Move to next transfer */
++	dws->cur_msg->state = next_transfer(dws);
++
++	/* Handle end of message */
++	if (dws->cur_msg->state == DONE_STATE) {
++		dws->cur_msg->status = 0;
++		giveback(dws);
++	} else
++		tasklet_schedule(&dws->pump_transfers);
++	
++	DBG_SPI("%s:line=%d\n",__func__,__LINE__);
++}
++EXPORT_SYMBOL_GPL(dw_spi_xfer_done);
++
++static irqreturn_t interrupt_transfer(struct dw_spi *dws)
++{
++	u16 irq_status;
++	u32 int_level = dws->fifo_len / 2;
++	u32 left;
++
++
++	irq_status = dw_readw(dws, SPIM_ISR) & 0x1f;
++	
++	DBG_SPI("%s:line=%d,irq_status=0x%x\n",__func__,__LINE__,irq_status);
++	
++	/* Error handling */
++	if (irq_status & (SPI_INT_TXOI | SPI_INT_RXOI | SPI_INT_RXUI)) {
++		dw_writew(dws, SPIM_ICR, SPI_CLEAR_INT_TXOI | SPI_CLEAR_INT_RXOI | SPI_CLEAR_INT_RXUI);
++		printk("%s:irq_status=0x%x\n",__func__,irq_status);
++		int_error_stop(dws, "interrupt_transfer: fifo overrun/underrun");
++		return IRQ_HANDLED;
++	}
++
++	if (irq_status & SPI_INT_TXEI) 
++	{
++		spi_mask_intr(dws, SPI_INT_TXEI);
++		dw_writer(dws);
++
++		if (dws->rx) {
++		    reader_all(dws);
++		}
++
++		/* Re-enable the IRQ if there is still data left to tx */
++		if (dws->tx_end > dws->tx)
++			spi_umask_intr(dws, SPI_INT_TXEI);
++		else
++			dw_spi_xfer_done(dws);
++	}
++
++	if (irq_status & SPI_INT_RXFI) {
++		spi_mask_intr(dws, SPI_INT_RXFI);
++		
++		reader_all(dws);
++
++		/* Re-enable the IRQ if there is still data left to rx */
++		if (dws->rx_end > dws->rx) {
++			left = ((dws->rx_end - dws->rx) / dws->n_bytes) - 1;
++		    left = (left > int_level) ? int_level : left;
++
++			dw_writew(dws, SPIM_RXFTLR, left);
++			spi_umask_intr(dws, SPI_INT_RXFI);
++		}
++		else {
++			dw_spi_xfer_done(dws);
++		}
++		
++	}
++
++	return IRQ_HANDLED;
++}
++
++
++static irqreturn_t dw_spi_irq(int irq, void *dev_id)
++{
++	struct dw_spi *dws = dev_id;
++	u16 irq_status = dw_readw(dws, SPIM_ISR)&0x3f;
++
++	if (!irq_status)
++		return IRQ_NONE;
++
++	if (!dws->cur_msg) {
++		spi_mask_intr(dws, SPI_INT_TXEI);
++		return IRQ_HANDLED;
++	}
++
++	return dws->transfer_handler(dws);
++}
++
++/* Must be called inside pump_transfers() */
++static void poll_transfer(struct dw_spi *dws)
++{	
++	DBG_SPI("%s:len=%ld\n",__func__, (long)dws->len);
++	
++	do {
++		dw_writer(dws);
++		dw_reader(dws);
++		cpu_relax();
++	} while (dws->rx_end > dws->rx);
++
++	dw_spi_xfer_done(dws);
++	
++}
++
++static void pump_transfers(unsigned long data)
++{
++	struct dw_spi *dws = (struct dw_spi *)data;
++	struct spi_message *message = NULL;
++	struct spi_transfer *transfer = NULL;
++	struct spi_transfer *previous = NULL;
++	struct spi_device *spi = NULL;
++	struct chip_data *chip = NULL;
++	u8 bits = 0;
++	u8 imask = 0;
++	u8 cs_change = 0;
++	u16 txint_level = 0;	
++	u16 rxint_level = 0;
++	u16 clk_div = 0;
++	u32 speed = 0;
++	u32 cr0 = 0;	
++	u16 dma_ctrl = 0;
++	int i = 0;
++
++	/* Get current state information */
++	message = dws->cur_msg;
++	transfer = dws->cur_transfer;
++	chip = dws->cur_chip;
++	spi = message->spi;
++
++	if (unlikely(!chip->clk_div))
++	{
++		chip->clk_div = dws->max_freq / chip->speed_hz;
++		chip->clk_div = (chip->clk_div + 1) & 0xfffe;
++		chip->speed_hz = dws->max_freq / chip->clk_div;
++	}
++
++
++	if (message->state == ERROR_STATE) {
++		message->status = -EIO;
++		goto early_exit;
++	}
++
++	/* Handle end of message */
++	if (message->state == DONE_STATE) {
++		message->status = 0;
++		goto early_exit;
++	}
++
++	/* Delay if requested at end of transfer*/
++	if (message->state == RUNNING_STATE) {
++		previous = list_entry(transfer->transfer_list.prev,
++					struct spi_transfer,
++					transfer_list);
++		if (previous->delay_usecs)
++			udelay(previous->delay_usecs);
++	}
++
++	dws->n_bytes = chip->n_bytes;
++	dws->dma_width = chip->dma_width;
++	dws->cs_control = chip->cs_control;
++
++	dws->rx_dma = transfer->rx_dma;
++	dws->tx_dma = transfer->tx_dma;
++	dws->tx = (void *)transfer->tx_buf;
++	dws->tx_end = dws->tx + transfer->len;
++	dws->rx = transfer->rx_buf;
++	dws->rx_end = dws->rx + transfer->len;
++	dws->cs_change = transfer->cs_change;
++	dws->len = dws->cur_transfer->len;
++	if (chip != dws->prev_chip)
++		cs_change = 1;
++
++	cr0 = chip->cr0;
++
++	
++
++	/* Handle per transfer options for bpw and speed */
++	if (transfer->speed_hz) {
++		speed = chip->speed_hz;
++
++		if (transfer->speed_hz != speed) {
++			speed = transfer->speed_hz;
++			if (speed > dws->max_freq) {
++				printk(KERN_ERR "MRST SPI0: unsupported"
++					"freq: %dHz\n", speed);
++				message->status = -EIO;
++				goto early_exit;
++			}
++
++			/* clk_div doesn't support odd number */
++			clk_div = dws->max_freq / speed;
++			clk_div = (clk_div + 1) & 0xfffe;
++
++			chip->speed_hz = dws->max_freq / clk_div;
++			chip->clk_div = clk_div;
++		}
++	}
++	DBG_SPI("%s:len=%ld,clk_div=%d,speed_hz=%d\n",__func__, (long)dws->len,chip->clk_div,chip->speed_hz);
++	if (transfer->bits_per_word) {
++		bits = transfer->bits_per_word;
++
++		switch (bits) {
++		case 8:
++		case 16:
++			dws->n_bytes = dws->dma_width = bits >> 3;
++			break;
++		default:
++			printk(KERN_ERR "MRST SPI0: unsupported bits:"
++				"%db\n", bits);
++			message->status = -EIO;
++			goto early_exit;
++		}
++
++		cr0 =((dws->n_bytes) << SPI_DFS_OFFSET)
++			| (SPI_HALF_WORLD_OFF << SPI_HALF_WORLD_TX_OFFSET)
++			| (SPI_SSN_DELAY_ONE << SPI_SSN_DELAY_OFFSET)
++			| (chip->type << SPI_FRF_OFFSET)
++			| (spi->mode << SPI_MODE_OFFSET)
++			| (chip->tmode << SPI_TMOD_OFFSET);
++	}
++	message->state = RUNNING_STATE;
++
++	/*
++	 * Adjust transfer mode if necessary. Requires platform dependent
++	 * chipselect mechanism.
++	 */
++	if (dws->cs_control) {
++		if (dws->rx && dws->tx)
++			chip->tmode = SPI_TMOD_TR;
++		else if (dws->rx)
++			chip->tmode = SPI_TMOD_RO;
++		else
++			chip->tmode = SPI_TMOD_TO;
++
++
++		cr0 &= ~(0x3 << SPI_MODE_OFFSET);		
++		cr0 &= ~(0x3 << SPI_TMOD_OFFSET);
++		cr0 &= ~(0x1 << SPI_OPMOD_OFFSET);	
++		cr0 |= (spi->mode << SPI_MODE_OFFSET);
++		cr0 |= (chip->tmode << SPI_TMOD_OFFSET);
++		cr0 |= ((chip->slave_enable & 1) << SPI_OPMOD_OFFSET);
++	}
++
++	/* Check if current transfer is a DMA transaction */
++	dws->dma_mapped = map_dma_buffers(dws);
++
++	/*
++	 * Interrupt mode
++	 * we only need set the TXEI IRQ, as TX/RX always happen syncronizely
++	 */
++	if (!dws->dma_mapped && !chip->poll_mode) {	
++		int templen ;
++		
++		if (chip->tmode == SPI_TMOD_RO) {
++			templen = dws->len / dws->n_bytes - 1;
++			rxint_level = dws->fifo_len / 2;
++			rxint_level = (templen > rxint_level) ? rxint_level : templen;
++			imask |= SPI_INT_RXFI;
++		}
++		else {	
++			templen = dws->len / dws->n_bytes;
++			txint_level = dws->fifo_len / 2;
++			txint_level = (templen > txint_level) ? txint_level : templen;
++			imask |= SPI_INT_TXEI | SPI_INT_TXOI;
++		}
++		dws->transfer_handler = interrupt_transfer;
++	}
++
++	/*
++	 * Reprogram registers only if
++	 *	1. chip select changes
++	 *	2. clk_div is changed
++	 *	3. control value changes
++	 */
++	//if (dw_readw(dws, SPIM_CTRLR0) != cr0 || cs_change || clk_div || imask) 		
++	if(dws->tx || dws->rx)
++	{
++		spi_enable_chip(dws, 0);
++		if (dw_readl(dws, SPIM_CTRLR0) != cr0)
++			dw_writel(dws, SPIM_CTRLR0, cr0);
++
++
++		spi_set_clk(dws, clk_div ? clk_div : chip->clk_div);		
++		spi_chip_sel(dws, spi->chip_select);
++
++		dw_writew(dws, SPIM_CTRLR1, dws->len-1);
++
++		if (txint_level != dw_readl(dws, SPIM_TXFTLR))
++			dw_writew(dws, SPIM_TXFTLR, txint_level);
++			
++		if (rxint_level != dw_readl(dws, SPIM_RXFTLR))
++		{
++			dw_writew(dws, SPIM_RXFTLR, rxint_level);
++			DBG_SPI("%s:rxint_level=%d\n",__func__,rxint_level);
++		}
++
++		/* setup DMA related registers */
++		if(dws->dma_mapped)
++		{
++			dws->dmatdlr = dws->n_bytes;
++			dws->dmardlr = dws->n_bytes - 1;
++			for(i=dws->n_bytes; i<=dws->fifo_len / 4; i++)
++			{
++				if((dws->len / dws->n_bytes) % i == 0)
++				dws->dmatdlr = i;
++			}
++
++			/* Set the interrupt mask, for poll mode just diable all int */
++			spi_mask_intr(dws, 0xff);		
++			if(dws->tx)
++			{
++				dma_ctrl |= SPI_DMACR_TX_ENABLE;		
++				dw_writew(dws, SPIM_DMATDLR, dws->dmatdlr);
++				dw_writew(dws, SPIM_CTRLR1, dws->len-1);	
++			}
++
++			dws->dmardlr = (dws->dmatdlr != dws->n_bytes)?(dws->dmatdlr-1):(dws->n_bytes-1);
++			
++			if (dws->rx)
++			{
++				dma_ctrl |= SPI_DMACR_RX_ENABLE;	
++				dw_writew(dws, SPIM_DMARDLR, dws->dmardlr);
++				dw_writew(dws, SPIM_CTRLR1, dws->len-1);
++			}
++			dw_writew(dws, SPIM_DMACR, dma_ctrl);
++
++			DBG_SPI("%s:dma_ctrl=0x%x,dmatdlr=%d,dmardlr=%d\n",__func__,dw_readw(dws, SPIM_DMACR),dws->dmatdlr, dws->dmardlr);
++			
++		}
++
++		if((!dws->dma_mapped) || (dws->dma_mapped && dws->tx))
++		spi_enable_chip(dws, 1);
++
++		DBG_SPI("%s:ctrl0=0x%x\n",__func__,dw_readw(dws, SPIM_CTRLR0));
++
++		/* Set the interrupt mask, for poll mode just diable all int */
++		spi_mask_intr(dws, 0xff);
++		if (imask)
++			spi_umask_intr(dws, imask);
++		
++		if (cs_change)
++			dws->prev_chip = chip;
++
++	}
++	else
++	{
++		printk("%s:warning tx and rx is null\n",__func__);
++	}
++
++	/*dma should be ready before spi_enable_chip*/
++	if (dws->dma_mapped)
++	dws->dma_ops->dma_transfer(dws, cs_change); 
++
++	if (chip->poll_mode)
++		poll_transfer(dws);
++
++	return;
++
++early_exit:
++	giveback(dws);
++	return;
++}
++
++static int dw_spi_transfer_one_message(struct spi_master *master,
++					   struct spi_message *msg)
++{
++	struct dw_spi *dws = spi_master_get_devdata(master);
++	int ret = 0;
++	
++	dws->cur_msg = msg;
++	/* Initial message state*/
++	dws->cur_msg->state = START_STATE;
++	dws->cur_transfer = list_entry(dws->cur_msg->transfers.next,
++						struct spi_transfer,
++						transfer_list);
++
++	/* prepare to setup the SSP, in pump_transfers, using the per
++	 * chip configuration */
++	dws->cur_chip = spi_get_ctldata(dws->cur_msg->spi);
++	
++	dws->dma_mapped = map_dma_buffers(dws);	
++	INIT_COMPLETION(dws->xfer_completion);
++	
++	/* Mark as busy and launch transfers */
++	tasklet_schedule(&dws->pump_transfers);
++	
++	DBG_SPI("%s:line=%d\n",__func__,__LINE__);
++	if (dws->dma_mapped)
++	{
++		ret = wait_for_completion_timeout(&dws->xfer_completion,
++							msecs_to_jiffies(2000));
++		if(ret == 0)
++		{
++			dev_err(&dws->master->dev, "dma transfer timeout\n");			
++			giveback(dws);
++			return 0;
++		}
++		
++		DBG_SPI("%s:wait %d\n",__func__, ret);
++	}
++		
++	return 0;
++}
++
++static int dw_spi_prepare_transfer(struct spi_master *master)
++{
++	struct dw_spi *dws = spi_master_get_devdata(master);
++
++	//pm_runtime_get_sync(&dws->pdev->dev);
++	
++	DBG_SPI("%s:line=%d\n",__func__,__LINE__);
++	return 0;
++}
++
++static int dw_spi_unprepare_transfer(struct spi_master *master)
++{
++	struct dw_spi *dws = spi_master_get_devdata(master);
++
++	/* Disable the SSP now */
++	//write_SSCR0(read_SSCR0(dws->ioaddr) & ~SSCR0_SSE,
++	//	    dws->ioaddr);
++
++	//pm_runtime_mark_last_busy(&dws->pdev->dev);
++	//pm_runtime_put_autosuspend(&dws->pdev->dev);
++	
++	DBG_SPI("%s:line=%d\n",__func__,__LINE__);
++	return 0;
++}
++
++/* This may be called twice for each spi dev */
++static int dw_spi_setup(struct spi_device *spi)
++{
++	struct dw_spi_chip *chip_info = NULL;
++	struct chip_data *chip;
++
++	if (spi->bits_per_word != 8 && spi->bits_per_word != 16)
++		return -EINVAL;
++
++	/* Only alloc on first setup */
++	chip = spi_get_ctldata(spi);
++	if (!chip) {
++		chip = kzalloc(sizeof(struct chip_data), GFP_KERNEL);
++		if (!chip)
++			return -ENOMEM;
++
++		chip->cs_control = spi_cs_control;
++		chip->enable_dma = 0; 
++	}
++
++	/*
++	 * Protocol drivers may change the chip settings, so...
++	 * if chip_info exists, use it
++	 */
++	chip_info = spi->controller_data;
++
++	/* chip_info doesn't always exist */
++	if (chip_info) {
++		if (chip_info->cs_control)
++			chip->cs_control = chip_info->cs_control;
++
++		chip->poll_mode = chip_info->poll_mode;
++		chip->type = chip_info->type;
++
++		chip->rx_threshold = 0;
++		chip->tx_threshold = 0;
++
++		chip->enable_dma = chip_info->enable_dma;
++	}
++
++	if (spi->bits_per_word <= 8) {
++		chip->n_bytes = 1;
++		chip->dma_width = 1;
++	} else if (spi->bits_per_word <= 16) {
++		chip->n_bytes = 2;
++		chip->dma_width = 2;
++	} else {
++		/* Never take >16b case for MRST SPIC */
++		dev_err(&spi->dev, "invalid wordsize\n");
++		return -EINVAL;
++	}
++	chip->bits_per_word = spi->bits_per_word;
++
++	if (!spi->max_speed_hz) {
++		dev_err(&spi->dev, "No max speed HZ parameter\n");
++		return -EINVAL;
++	}
++	chip->speed_hz = spi->max_speed_hz;
++
++	chip->tmode = 0; /* Tx & Rx */
++	/* Default SPI mode is SCPOL = 0, SCPH = 0 */
++	chip->cr0 = ((chip->n_bytes) << SPI_DFS_OFFSET)
++		    | (SPI_HALF_WORLD_OFF << SPI_HALF_WORLD_TX_OFFSET)
++			| (SPI_SSN_DELAY_ONE << SPI_SSN_DELAY_OFFSET)
++			| (chip->type << SPI_FRF_OFFSET)
++			| (spi->mode  << SPI_MODE_OFFSET)
++			| (chip->tmode << SPI_TMOD_OFFSET);
++
++	spi_set_ctldata(spi, chip);
++	
++	//printk("%s:line=%d\n",__func__,__LINE__);
++	return 0;
++}
++
++static void dw_spi_cleanup(struct spi_device *spi)
++{
++	struct chip_data *chip = spi_get_ctldata(spi);
++	kfree(chip);
++}
++
++
++/* Restart the controller, disable all interrupts, clean rx fifo */
++static void spi_hw_init(struct dw_spi *dws)
++{
++	spi_enable_chip(dws, 0);
++	spi_mask_intr(dws, 0xff);
++
++	/*
++	 * Try to detect the FIFO depth if not set by interface driver,
++	 * the depth could be from 2 to 32 from HW spec
++	 */
++	if (!dws->fifo_len) {
++		u32 fifo;
++		for (fifo = 2; fifo <= 31; fifo++) {
++			dw_writew(dws, SPIM_TXFTLR, fifo);
++			if (fifo != dw_readw(dws, SPIM_TXFTLR))
++				break;
++		}
++
++		dws->fifo_len = (fifo == 31) ? 0 : fifo;
++		dw_writew(dws, SPIM_TXFTLR, 0);
++	}
++	
++	//spi_enable_chip(dws, 1);
++	flush(dws);
++	DBG_SPI("%s:fifo_len=%d\n",__func__, dws->fifo_len);
++}
++
++int dw_spi_add_host(struct dw_spi *dws)
++{
++	struct spi_master *master;
++	int ret;
++
++	BUG_ON(dws == NULL);
++
++	master = spi_alloc_master(dws->parent_dev, 0);
++	if (!master) {
++		ret = -ENOMEM;
++		goto exit;
++	}
++
++	dws->master = master;
++	dws->type = SSI_MOTO_SPI;
++	dws->prev_chip = NULL;
++	dws->dma_inited = 0;
++	dws->tx_dma_addr = (dma_addr_t)(dws->paddr + SPIM_TXDR);	
++	dws->rx_dma_addr = (dma_addr_t)(dws->paddr + SPIM_RXDR);
++	snprintf(dws->name, sizeof(dws->name), "dw_spi%d",
++			dws->bus_num);
++
++	ret = request_irq(dws->irq, dw_spi_irq, IRQF_SHARED,
++			dws->name, dws);
++	if (ret < 0) {
++		dev_err(&master->dev, "can not get IRQ\n");
++		goto err_free_master;
++	}
++	
++	master->dev.parent = dws->parent_dev;
++	master->dev.of_node = dws->parent_dev->of_node;	
++	master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LOOP;
++	master->bus_num = dws->bus_num;
++	master->num_chipselect = dws->num_cs;
++	master->cleanup = dw_spi_cleanup;
++	master->setup = dw_spi_setup;
++	master->transfer_one_message = dw_spi_transfer_one_message;
++	master->prepare_transfer_hardware = dw_spi_prepare_transfer;
++	master->unprepare_transfer_hardware = dw_spi_unprepare_transfer;
++	
++	spin_lock_init(&dws->lock);
++	tasklet_init(&dws->pump_transfers,
++			pump_transfers,	(unsigned long)dws);
++
++
++	/* Basic HW init */
++	spi_hw_init(dws);
++
++	if (dws->dma_ops && dws->dma_ops->dma_init) {
++		ret = dws->dma_ops->dma_init(dws);
++		if (ret) {
++			dev_warn(&master->dev, "DMA init failed,ret=%d\n",ret);
++			dws->dma_inited = 0;
++		}
++	}
++	
++	spi_master_set_devdata(master, dws);
++	ret = spi_register_master(master);
++	if (ret) {
++		dev_err(&master->dev, "problem registering spi master\n");
++		goto err_queue_alloc;
++	}
++
++	spi_debugfs_init(dws);
++
++	
++	DBG_SPI("%s:bus_num=%d\n",__func__, dws->bus_num);
++	return 0;
++
++err_queue_alloc:
++	if (dws->dma_ops && dws->dma_ops->dma_exit)
++		dws->dma_ops->dma_exit(dws);
++/* err_diable_hw: */
++	spi_enable_chip(dws, 0);
++	free_irq(dws->irq, dws);
++err_free_master:
++	spi_master_put(master);
++exit:
++	return ret;
++}
++EXPORT_SYMBOL_GPL(dw_spi_add_host);
++
++void dw_spi_remove_host(struct dw_spi *dws)
++{
++	if (!dws)
++		return;
++	
++	spi_debugfs_remove(dws);
++
++	if (dws->dma_ops && dws->dma_ops->dma_exit)
++		dws->dma_ops->dma_exit(dws);
++	
++	spi_enable_chip(dws, 0);
++	/* Disable clk */
++	spi_set_clk(dws, 0);
++	free_irq(dws->irq, dws);
++
++	/* Disconnect from the SPI framework */
++	spi_unregister_master(dws->master);
++
++	
++	DBG_SPI("%s:bus_num=%d\n",__func__, dws->bus_num);
++}
++EXPORT_SYMBOL_GPL(dw_spi_remove_host);
++
++int dw_spi_suspend_host(struct dw_spi *dws)
++{
++	int ret = 0;
++	
++	ret = spi_master_suspend(dws->master);
++	if (ret != 0)
++	return ret;
++	
++	spi_enable_chip(dws, 0);
++	spi_set_clk(dws, 0);
++	
++	clk_disable_unprepare(dws->clk_spi);
++	
++	DBG_SPI("%s:bus_num=%d\n",__func__, dws->bus_num);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(dw_spi_suspend_host);
++
++int dw_spi_resume_host(struct dw_spi *dws)
++{
++	int ret;
++
++	/* Enable the SPI clock */
++	clk_prepare_enable(dws->clk_spi);
++	
++	spi_hw_init(dws);
++
++	/* Start the queue running */
++	ret = spi_master_resume(dws->master);
++	if (ret != 0) {
++		printk("%s:problem starting queue (%d)\n", __func__, ret);
++		return ret;
++	}
++	
++	DBG_SPI("%s:bus_num=%d\n",__func__, dws->bus_num);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(dw_spi_resume_host);
++
++MODULE_AUTHOR("Luo Wei <lw@rock-chips.com>");
++MODULE_DESCRIPTION("Driver for DesignWare SPI controller core");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/spi/spi-rockchip-core.h b/drivers/spi/spi-rockchip-core.h
+new file mode 100755
+index 0000000..bb07d58
+--- /dev/null
++++ b/drivers/spi/spi-rockchip-core.h
+@@ -0,0 +1,312 @@
++#ifndef DW_SPI_HEADER_H
++#define DW_SPI_HEADER_H
++
++#include <linux/io.h>
++#include <linux/scatterlist.h>
++#include <linux/dmaengine.h>
++
++
++#if 1
++#define DBG_SPI(x...)  if(atomic_read(&dws->debug_flag) == 1) printk(KERN_DEBUG x)
++#else
++#define DBG_SPI(x...)
++#endif
++
++/* SPI register offsets */
++#define SPIM_CTRLR0				0x0000
++#define SPIM_CTRLR1				0x0004
++#define SPIM_SSIENR				0x0008
++#define SPIM_SER				0x000c
++#define SPIM_BAUDR				0x0010
++#define SPIM_TXFTLR				0x0014
++#define SPIM_RXFTLR				0x0018
++#define SPIM_TXFLR				0x001c
++#define SPIM_RXFLR				0x0020
++#define SPIM_SR					0x0024
++#define SPIM_IPR                0x0028
++#define SPIM_IMR				0x002c
++#define SPIM_ISR				0x0030
++#define SPIM_RISR				0x0034
++#define SPIM_ICR				0x0038
++#define SPIM_DMACR				0x003c
++#define SPIM_DMATDLR			0x0040
++#define SPIM_DMARDLR			0x0044
++#define SPIM_TXDR				0x0400
++#define SPIM_RXDR               0x0800
++
++/* --------Bit fields in CTRLR0--------begin */
++
++#define SPI_DFS_OFFSET			0                  /* Data Frame Size */
++#define SPI_DFS_4BIT            0x00
++#define SPI_DFS_8BIT            0x01
++#define SPI_DFS_16BIT           0x02
++#define SPI_DFS_RESV            0x03
++
++#define SPI_FRF_OFFSET			16                 /* Frame Format */
++#define SPI_FRF_SPI			    0x00               /* motorola spi */
++#define SPI_FRF_SSP			    0x01               /* Texas Instruments SSP*/
++#define SPI_FRF_MICROWIRE		0x02               /*  National Semiconductors Microwire */
++#define SPI_FRF_RESV			0x03
++
++#define SPI_MODE_OFFSET		    6                 /* SCPH & SCOL */
++
++#define SPI_SCPH_OFFSET			6                  /* Serial Clock Phase */
++#define SPI_SCPH_TOGMID         0                  /* Serial clock toggles in middle of first data bit */
++#define SPI_SCPH_TOGSTA         1                  /* Serial clock toggles at start of first data bit */
++
++#define SPI_SCOL_OFFSET			7                  /* Serial Clock Polarity */
++
++#define SPI_OPMOD_OFFSET	    20
++#define SPI_OPMOD_MASTER        0
++#define SPI_OPMOD_SLAVE         1
++
++#define SPI_TMOD_OFFSET			18                 /* Transfer Mode */
++//#define SPI_TMOD_MASK			(0x3 << SPI_TMOD_OFFSET)
++#define	SPI_TMOD_TR			    0x00		       /* xmit & recv */
++#define SPI_TMOD_TO			    0x01		       /* xmit only */
++#define SPI_TMOD_RO			    0x02		       /* recv only */
++#define SPI_TMOD_RESV		    0x03
++
++#define SPI_CFS_OFFSET			2                  /* Control Frame Size */
++
++#define SPI_CSM_OFFSET          8                  /* Chip Select Mode */
++#define SPI_CSM_KEEP            0x00               /* ss_n keep low after every frame data is transferred */
++#define SPI_CSM_HALF            0x01               /* ss_n be high for half sclk_out cycles after every frame data is transferred */
++#define SPI_CSM_ONE             0x02               /* ss_n be high for one sclk_out cycle after every frame data is transferred */
++
++#define SPI_SSN_DELAY_OFFSET    10
++#define SPI_SSN_DELAY_HALF      0x00
++#define SPI_SSN_DELAY_ONE       0x01
++
++#define SPI_HALF_WORLD_TX_OFFSET       13
++#define SPI_HALF_WORLD_ON       0x00
++#define SPI_HALF_WORLD_OFF      0x01
++
++
++/* --------Bit fields in CTRLR0--------end */
++
++
++/* Bit fields in SR, 7 bits */
++#define SR_MASK				0x7f		/* cover 7 bits */
++#define SR_BUSY				(1 << 0)
++#define SR_TF_FULL		    (1 << 1)
++#define SR_TF_EMPT			(1 << 2)
++#define SR_RF_EMPT		    (1 << 3)
++#define SR_RF_FULL			(1 << 4)
++
++/* Bit fields in ISR, IMR, RISR, 7 bits */
++#define SPI_INT_TXEI			(1 << 0)
++#define SPI_INT_TXOI			(1 << 1)
++#define SPI_INT_RXUI			(1 << 2)
++#define SPI_INT_RXOI			(1 << 3)
++#define SPI_INT_RXFI			(1 << 4)
++
++/* Bit fields in DMACR */
++#define SPI_DMACR_TX_ENABLE     (1 << 1)
++#define SPI_DMACR_RX_ENABLE     (1 << 0)
++
++/* Bit fields in ICR */
++#define SPI_CLEAR_INT_ALL       (1<< 0)
++#define SPI_CLEAR_INT_RXUI      (1 << 1)
++#define SPI_CLEAR_INT_RXOI      (1 << 2)
++#define SPI_CLEAR_INT_TXOI      (1 << 3)
++
++#define SUSPND    (1<<0)
++#define SPIBUSY   (1<<1)
++#define RXBUSY    (1<<2)
++#define TXBUSY    (1<<3)
++
++
++enum dw_ssi_type {
++	SSI_MOTO_SPI = 0,
++	SSI_TI_SSP,
++	SSI_NS_MICROWIRE,
++};
++
++struct dw_spi;
++struct dw_spi_dma_ops {
++	int (*dma_init)(struct dw_spi *dws);
++	void (*dma_exit)(struct dw_spi *dws);
++	int (*dma_transfer)(struct dw_spi *dws, int cs_change);
++};
++
++struct dw_spi {
++	struct spi_master	*master;
++	struct spi_device	*cur_dev;
++	struct device		*parent_dev;
++	enum dw_ssi_type	type;
++	char			name[16];
++
++	struct clk          *clk_spi;
++	struct clk          *pclk_spi;
++
++	void __iomem		*regs;
++	unsigned long		paddr;
++	u32			iolen;
++	int			irq;
++	u32			fifo_len;	/* depth of the FIFO buffer */
++	u32			max_freq;	/* max bus freq supported */
++
++	u16			bus_num;
++	u16			num_cs;		/* supported slave numbers */
++
++	/* Driver message queue */
++	struct workqueue_struct	*workqueue;
++	struct work_struct	pump_messages;
++	spinlock_t		lock;
++	struct list_head	queue;
++	int			busy;
++	int			run;
++
++	/* Message Transfer pump */
++	struct tasklet_struct	pump_transfers;
++
++	/* Current message transfer state info */
++	struct spi_message	*cur_msg;
++	struct spi_transfer	*cur_transfer;
++	struct chip_data	*cur_chip;
++	struct chip_data	*prev_chip;
++	size_t			len;
++	void			*tx;
++	void			*tx_end;
++	void			*rx;
++	void			*rx_end;
++	int				dma_mapped;
++	dma_addr_t		rx_dma;
++	dma_addr_t		tx_dma;
++	size_t			rx_map_len;
++	size_t			tx_map_len;
++	u8			n_bytes;	/* current is a 1/2 bytes op */
++	u8			max_bits_per_word;	/* maxim is 16b */
++	u32			dma_width;
++	int			dmatdlr;
++	int			dmardlr;
++	int			cs_change;
++	void			*tx_buffer;
++	void			*rx_buffer;
++	dma_addr_t		rx_dma_init;
++	dma_addr_t		tx_dma_init;
++	dma_cookie_t		rx_cookie;
++	dma_cookie_t		tx_cookie;
++	int 			state;
++	struct completion	xfer_completion;
++	irqreturn_t		(*transfer_handler)(struct dw_spi *dws);
++	void			(*cs_control)(struct dw_spi *dws, u32 cs, u8 flag);
++
++	/* Dma info */
++	int			dma_inited;
++	struct dma_chan		*txchan;
++	struct scatterlist	tx_sgl;
++	struct dma_chan		*rxchan;
++	struct scatterlist	rx_sgl;
++	int			dma_chan_done;
++	struct device		*dma_dev;
++	dma_addr_t		tx_dma_addr; /* phy address of the Data register */	
++	dma_addr_t		rx_dma_addr; /* phy address of the Data register */
++	struct dw_spi_dma_ops	*dma_ops;
++	void			*dma_priv; /* platform relate info */
++	
++	//struct pci_dev		*dmac;
++	atomic_t		debug_flag;
++
++	/* Bus interface info */
++	void			*priv;
++#ifdef CONFIG_DEBUG_FS
++	struct dentry *debugfs;
++#endif
++};
++
++static inline u32 dw_readl(struct dw_spi *dws, u32 offset)
++{
++	return __raw_readl(dws->regs + offset);
++}
++
++static inline void dw_writel(struct dw_spi *dws, u32 offset, u32 val)
++{
++	__raw_writel(val, dws->regs + offset);
++}
++
++static inline u16 dw_readw(struct dw_spi *dws, u32 offset)
++{
++	return __raw_readw(dws->regs + offset);
++}
++
++static inline void dw_writew(struct dw_spi *dws, u32 offset, u16 val)
++{
++	__raw_writew(val, dws->regs + offset);
++}
++
++static inline void spi_enable_chip(struct dw_spi *dws, int enable)
++{
++	dw_writel(dws, SPIM_SSIENR, (enable ? 1 : 0));
++}
++
++static inline void spi_set_clk(struct dw_spi *dws, u16 div)
++{
++	dw_writel(dws, SPIM_BAUDR, div);
++}
++
++static inline void spi_chip_sel(struct dw_spi *dws, u16 cs)
++{
++	if (cs > dws->num_cs)
++		return;
++
++	if (dws->cs_control)
++		dws->cs_control(dws, cs, 1);
++
++	dw_writel(dws, SPIM_SER, 1 << cs);
++
++	DBG_SPI("%s:cs=%d\n",__func__,cs);
++}
++
++static  inline void spi_cs_control(struct dw_spi *dws, u32 cs, u8 flag)
++{
++	if (flag)
++		dw_writel(dws, SPIM_SER, 1 << cs);
++	else 		
++		dw_writel(dws, SPIM_SER, 0);
++	
++	return;
++}
++
++
++/* Disable IRQ bits */
++static inline void spi_mask_intr(struct dw_spi *dws, u32 mask)
++{
++	u32 new_mask;
++
++	new_mask = dw_readl(dws, SPIM_IMR) & ~mask;
++	dw_writel(dws, SPIM_IMR, new_mask);
++}
++
++/* Enable IRQ bits */
++static inline void spi_umask_intr(struct dw_spi *dws, u32 mask)
++{
++	u32 new_mask;
++
++	new_mask = dw_readl(dws, SPIM_IMR) | mask;
++	dw_writel(dws, SPIM_IMR, new_mask);
++}
++
++/*
++ * Each SPI slave device to work with dw_api controller should
++ * has such a structure claiming its working mode (PIO/DMA etc),
++ * which can be save in the "controller_data" member of the
++ * struct spi_device
++ */
++struct dw_spi_chip {
++	u8 poll_mode;	/* 0 for contoller polling mode */
++	u8 type;	/* SPI/SSP/Micrwire */
++	u8 enable_dma;
++	void (*cs_control)(struct dw_spi *dws, u32 cs, u8 flag);
++};
++
++extern int dw_spi_add_host(struct dw_spi *dws);
++extern void dw_spi_remove_host(struct dw_spi *dws);
++extern int dw_spi_suspend_host(struct dw_spi *dws);
++extern int dw_spi_resume_host(struct dw_spi *dws);
++extern void dw_spi_xfer_done(struct dw_spi *dws);
++
++/* platform related setup */
++extern int dw_spi_dma_init(struct dw_spi *dws); /* Intel MID platforms */
++#endif /* SPIM_HEADER_H */
+diff --git a/drivers/spi/spi-rockchip-dma.c b/drivers/spi/spi-rockchip-dma.c
+new file mode 100755
+index 0000000..6952201
+--- /dev/null
++++ b/drivers/spi/spi-rockchip-dma.c
+@@ -0,0 +1,387 @@
++/*
++ * Special handling for DW core on Intel MID platform
++ *
++ * Copyright (c) 2009, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <linux/interrupt.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/workqueue.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/clk.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/spi/spi.h>
++#include <linux/gpio.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <linux/platform_data/spi-rockchip.h>
++
++
++#include "spi-rockchip-core.h"
++
++#ifdef CONFIG_SPI_ROCKCHIP_DMA
++#define DMA_BUFFER_SIZE (PAGE_SIZE<<4)
++
++
++struct spi_dma_slave {
++	struct dma_chan *ch;
++	enum dma_transfer_direction direction;
++	unsigned int dmach;
++};
++
++
++struct spi_dma {
++	struct spi_dma_slave	dmas_tx;
++	struct spi_dma_slave	dmas_rx;
++};
++
++static void printk_transfer_data(struct dw_spi *dws, char *buf, int len)
++{
++	int i = 0;
++	for(i=0; i<len; i++)
++		DBG_SPI("0x%02x,",*buf++);
++
++	DBG_SPI("\n");
++
++}
++
++static int mid_spi_dma_init(struct dw_spi *dws)
++{
++	struct spi_dma *dw_dma = dws->dma_priv;
++	struct spi_dma_slave *rxs, *txs;
++	
++	DBG_SPI("%s:start\n",__func__);
++
++	/* 1. Init rx channel */
++	dws->rxchan = dma_request_slave_channel(dws->parent_dev, "rx");
++	if (!dws->rxchan)
++	{
++		dev_err(dws->parent_dev, "Failed to get RX DMA channel\n");
++		goto err_exit;
++	}
++	
++	DBG_SPI("%s:rx_chan_id=%d\n",__func__,dws->rxchan->chan_id);
++	
++	rxs = &dw_dma->dmas_rx;
++	dws->rxchan->private = rxs;
++
++	/* 2. Init tx channel */
++	dws->txchan = dma_request_slave_channel(dws->parent_dev, "tx");
++	if (!dws->txchan)
++	{
++		dev_err(dws->parent_dev, "Failed to get TX DMA channel\n");
++		goto free_rxchan;
++	}
++	txs = &dw_dma->dmas_tx;
++	dws->txchan->private = txs;
++	
++	DBG_SPI("%s:tx_chan_id=%d\n",__func__,dws->txchan->chan_id);
++
++	dws->dma_inited = 1;
++
++	DBG_SPI("%s:line=%d\n",__func__,__LINE__);
++	return 0;
++
++free_rxchan:
++	dma_release_channel(dws->rxchan);
++err_exit:
++	return -1;
++
++}
++
++static void mid_spi_dma_exit(struct dw_spi *dws)
++{
++	DBG_SPI("%s:start\n",__func__);
++	dma_release_channel(dws->txchan);
++	dma_release_channel(dws->rxchan);
++}
++
++
++static void dw_spi_dma_rxcb(void *arg)
++{
++	struct dw_spi *dws = arg;
++	unsigned long flags;
++	struct dma_tx_state		state;
++	int				dma_status;
++
++	dma_sync_single_for_device(dws->rxchan->device->dev, dws->rx_dma,
++				   dws->len, DMA_FROM_DEVICE);
++	
++	dma_status = dmaengine_tx_status(dws->rxchan, dws->rx_cookie, &state);
++	
++	DBG_SPI("%s:dma_status=0x%x\n", __FUNCTION__, dma_status);
++	
++	spin_lock_irqsave(&dws->lock, flags);		
++	if (dma_status == DMA_SUCCESS)
++		dws->state &= ~RXBUSY;
++	else
++		dev_err(&dws->master->dev, "error:rx dma_status=%x\n", dma_status);
++
++	//copy data from dma to transfer buf
++	if(dws->cur_transfer && (dws->cur_transfer->rx_buf != NULL))
++	{
++		memcpy(dws->cur_transfer->rx_buf, dws->rx_buffer, dws->cur_transfer->len);
++		
++		DBG_SPI("dma rx:");
++		printk_transfer_data(dws, dws->cur_transfer->rx_buf, dws->cur_transfer->len);
++	}
++	
++	spin_unlock_irqrestore(&dws->lock, flags);
++	
++	/* If the other done */
++	if (!(dws->state & TXBUSY))
++	{
++		//DMA could not lose intterupt
++		dw_spi_xfer_done(dws);
++		complete(&dws->xfer_completion);
++		DBG_SPI("%s:complete\n", __FUNCTION__);
++	}
++
++}
++
++static void dw_spi_dma_txcb(void *arg)
++{
++	struct dw_spi *dws = arg;
++	unsigned long flags;
++	struct dma_tx_state		state;
++	int				dma_status;
++
++	dma_sync_single_for_device(dws->txchan->device->dev, dws->tx_dma,
++				   dws->len, DMA_TO_DEVICE);
++	
++	dma_status = dmaengine_tx_status(dws->txchan, dws->tx_cookie, &state);
++	
++	DBG_SPI("%s:dma_status=0x%x\n", __FUNCTION__, dma_status);
++	DBG_SPI("dma tx:");
++	printk_transfer_data(dws, (char *)dws->cur_transfer->tx_buf, dws->cur_transfer->len);
++	
++	spin_lock_irqsave(&dws->lock, flags);
++	
++	if (dma_status == DMA_SUCCESS)
++		dws->state &= ~TXBUSY;
++	else	
++		dev_err(&dws->master->dev, "error:tx dma_status=%x\n", dma_status);	
++
++	spin_unlock_irqrestore(&dws->lock, flags);
++	
++	/* If the other done */
++	if (!(dws->state & RXBUSY))
++	{
++		//DMA could not lose intterupt
++		dw_spi_xfer_done(dws);
++		complete(&dws->xfer_completion);
++		DBG_SPI("%s:complete\n", __FUNCTION__);
++	}
++
++}
++
++
++static int mid_spi_dma_transfer(struct dw_spi *dws, int cs_change)
++{
++	struct dma_async_tx_descriptor *txdesc = NULL, *rxdesc = NULL;
++	struct dma_chan *txchan, *rxchan;
++	struct dma_slave_config txconf, rxconf;
++	int ret = 0;
++	
++	enum dma_slave_buswidth width;
++
++	DBG_SPI("%s:cs_change=%d\n",__func__,cs_change);
++	
++	//alloc dma buffer default while cur_transfer->tx_dma or cur_transfer->rx_dma is null
++	if((dws->cur_transfer->tx_buf) && dws->dma_mapped && (!dws->cur_transfer->tx_dma))
++	{
++		//printk("%s:warning tx_dma is %p\n",__func__, (int *)dws->tx_dma);
++		memcpy(dws->tx_buffer, dws->cur_transfer->tx_buf, dws->cur_transfer->len);		
++		dws->tx_dma = dws->tx_dma_init;
++	}
++
++	if((dws->cur_transfer->rx_buf) && dws->dma_mapped && (!dws->cur_transfer->rx_dma))
++	{		
++		//printk("%s:warning rx_dma is %p\n",__func__, (int *)dws->rx_dma);
++		dws->rx_dma = dws->rx_dma_init;
++	}
++
++	
++	if (dws->tx)
++		dws->state |= TXBUSY;	
++	if (dws->rx)
++		dws->state |= RXBUSY;
++
++	
++	switch (dws->n_bytes) {
++	case 1:
++		width = DMA_SLAVE_BUSWIDTH_1_BYTE;
++		break;
++	case 2:
++		width = DMA_SLAVE_BUSWIDTH_2_BYTES;
++		break;
++	default:
++		width = DMA_SLAVE_BUSWIDTH_4_BYTES;
++		break;
++	}
++		
++	dws->dma_chan_done = 0;
++	
++	if (dws->tx)
++	txchan = dws->txchan;
++	
++	if (dws->rx)
++	rxchan = dws->rxchan;
++	
++	if (dws->tx)
++	{
++		/* 2. Prepare the TX dma transfer */
++		txconf.direction = DMA_MEM_TO_DEV;
++		txconf.dst_addr = dws->tx_dma_addr;
++		txconf.dst_maxburst = dws->dmatdlr;//dws->dma_width;
++		//txconf.src_addr_width = width;
++		txconf.dst_addr_width = width;
++		//txconf.device_fc = false;
++
++		ret = dmaengine_slave_config(txchan, &txconf);
++		if (ret) {
++			dev_warn(dws->parent_dev, "TX DMA slave config failed\n");
++			return -1;
++		}
++		
++		memset(&dws->tx_sgl, 0, sizeof(dws->tx_sgl));
++		dws->tx_sgl.dma_address = dws->tx_dma;
++#ifdef CONFIG_NEED_SG_DMA_LENGTH
++		dws->tx_sgl.dma_length = dws->len;
++#else
++		dws->tx_sgl.length = dws->len;
++#endif
++		txdesc = dmaengine_prep_slave_sg(txchan,
++					&dws->tx_sgl,
++					1,
++					DMA_MEM_TO_DEV,
++					DMA_PREP_INTERRUPT);
++		
++		txdesc->callback = dw_spi_dma_txcb;
++		txdesc->callback_param = dws;
++
++		DBG_SPI("%s:dst_addr=0x%p,tx_dma=0x%p,len=%ld,burst=%d,width=%d\n"
++			,__func__,(int *)dws->tx_dma_addr, (int *)dws->tx_dma, (long)dws->len,txconf.dst_maxburst, width);
++	}
++
++	if (dws->rx)
++	{
++		/* 3. Prepare the RX dma transfer */
++		rxconf.direction = DMA_DEV_TO_MEM;
++		rxconf.src_addr = dws->rx_dma_addr;
++		rxconf.src_maxburst = dws->dmardlr + 1;//dws->dma_width;
++		//rxconf.dst_addr_width = width;
++		rxconf.src_addr_width = width;
++		//rxconf.device_fc = false;
++
++		ret = dmaengine_slave_config(rxchan, &rxconf);
++		if (ret) {
++			dev_warn(dws->parent_dev, "RX DMA slave config failed\n");
++			return -1;
++		}
++
++		memset(&dws->rx_sgl, 0, sizeof(dws->rx_sgl));
++		dws->rx_sgl.dma_address = dws->rx_dma;
++#ifdef CONFIG_NEED_SG_DMA_LENGTH
++		dws->rx_sgl.dma_length = dws->len;				
++#else
++		dws->rx_sgl.length = dws->len;
++#endif
++
++		rxdesc = dmaengine_prep_slave_sg(rxchan,
++					&dws->rx_sgl,
++					1,
++					DMA_DEV_TO_MEM,
++					DMA_PREP_INTERRUPT);
++		rxdesc->callback = dw_spi_dma_rxcb;
++		rxdesc->callback_param = dws;
++		
++		DBG_SPI("%s:src_addr=0x%p,rx_dma=0x%p,len=%ld,burst=%d,width=%d\n"
++			,__func__, (int *)dws->rx_dma_addr, (int *)dws->rx_dma, (long)dws->len, rxconf.src_maxburst, width);
++	}
++
++	if(!dws->tx)
++	spi_enable_chip(dws, 1);
++	
++	/* rx must be started before tx due to spi instinct */	
++	if (dws->rx)
++	{		
++		dws->rx_cookie = dmaengine_submit(rxdesc);
++		dma_sync_single_for_device(rxchan->device->dev, dws->rx_dma,
++				   dws->len, DMA_FROM_DEVICE);
++		dma_async_issue_pending(rxchan);
++		
++		DBG_SPI("%s:rx end\n",__func__);
++	}
++	
++	if (dws->tx)
++	{		
++		dws->tx_cookie = dmaengine_submit(txdesc);
++		dma_sync_single_for_device(txchan->device->dev, dws->tx_dma,
++				   dws->len, DMA_TO_DEVICE);
++		dma_async_issue_pending(txchan);
++		
++		DBG_SPI("%s:tx end\n",__func__);
++	}
++	
++	return 0;
++}
++
++static struct dw_spi_dma_ops spi_dma_ops = {
++	.dma_init	= mid_spi_dma_init,
++	.dma_exit	= mid_spi_dma_exit,
++	.dma_transfer	= mid_spi_dma_transfer,
++};
++
++int dw_spi_dma_init(struct dw_spi *dws)
++{
++	DBG_SPI("%s:start\n",__func__);
++	dws->dma_priv = kzalloc(sizeof(struct spi_dma), GFP_KERNEL);
++	if (!dws->dma_priv)
++		return -ENOMEM;
++	dws->dma_ops = &spi_dma_ops;
++
++	dws->tx_buffer = dma_alloc_coherent(dws->parent_dev, DMA_BUFFER_SIZE, &dws->tx_dma_init, GFP_KERNEL | GFP_DMA);
++	if (!dws->tx_buffer)
++	{
++		dev_err(dws->parent_dev, "fail to dma tx buffer alloc\n");
++		return -1;
++	}
++
++	dws->rx_buffer = dma_alloc_coherent(dws->parent_dev, DMA_BUFFER_SIZE, &dws->rx_dma_init, GFP_KERNEL | GFP_DMA);
++	if (!dws->rx_buffer)
++	{
++		dev_err(dws->parent_dev, "fail to dma rx buffer alloc\n");
++		return -1;
++	}
++
++	memset(dws->tx_buffer, 0, DMA_BUFFER_SIZE);
++	memset(dws->rx_buffer, 0, DMA_BUFFER_SIZE);
++
++	dws->state = 0;
++	
++	init_completion(&dws->xfer_completion);
++	
++	return 0;
++}
++#endif
++
+diff --git a/drivers/spi/spi-rockchip-test.c b/drivers/spi/spi-rockchip-test.c
+new file mode 100755
+index 0000000..9b2ac14
+--- /dev/null
++++ b/drivers/spi/spi-rockchip-test.c
+@@ -0,0 +1,487 @@
++/*drivers/spi/spi-rockchip-test.c -spi test driver
++ *
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++/* dts config
++&spi0 {
++	status = "okay";
++	max-freq = <48000000>;   //spi internal clk, don't modify
++	//dma-names = "tx", "rx";   //enable dma
++	pinctrl-names = "default";  //pinctrl according to you board
++	pinctrl-0 = <&spi0_clk &spi0_tx &spi0_rx &spi0_cs0 &spi0_cs1>;
++	spi_test@00 {
++		compatible = "rockchip,spi_test_bus0_cs0";
++		reg = <0>;   //chip select  0:cs0  1:cs1
++		spi-max-frequency = <24000000>;   //spi output clock
++		//spi-cpha;      not support
++		//spi-cpol; 	//if the property is here it is 1:clk is high, else 0:clk is low  when idle
++	};
++
++	spi_test@01 {
++		compatible = "rockchip,spi_test_bus0_cs1";
++		reg = <1>;
++		spi-max-frequency = <24000000>;
++		spi-cpha;
++		spi-cpol;
++	};
++};
++*/
++
++/* how to test spi
++* echo write 0 10 255 > /dev/spi_misc_test
++* echo write 0 10 255 init.rc > /dev/spi_misc_test
++* echo read 0 10 255 > /dev/spi_misc_test
++* echo setspeed 0 1000000 > /dev/spi_misc_test
++*/
++
++#include <linux/interrupt.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/workqueue.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/clk.h>
++#include <linux/fs.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/spi/spi.h>
++#include <linux/gpio.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <linux/miscdevice.h>
++#include <linux/hrtimer.h>
++#include <linux/platform_data/spi-rockchip.h>
++#include <asm/uaccess.h>
++#include <linux/syscalls.h>
++#include "spi-rockchip-core.h"
++
++#define MAX_SPI_DEV_NUM 6
++#define SPI_MAX_SPEED_HZ	12000000
++
++struct spi_test_data {
++	struct device	*dev;
++	struct spi_device *spi;
++	char *rx_buf;
++	int rx_len;
++	char *tx_buf;
++	int tx_len;
++};
++
++static struct spi_test_data *g_spi_test_data[MAX_SPI_DEV_NUM];
++
++int spi_write_slt(int id, const void *txbuf, size_t n)
++{
++	int ret = -1;
++	struct spi_device *spi = NULL;
++
++	if (id >= MAX_SPI_DEV_NUM)
++		return -1;
++	if (!g_spi_test_data[id]) {
++		pr_err("g_spi.%d is NULL\n", id);
++		return -1;
++	} else {
++		spi = g_spi_test_data[id]->spi;
++	}
++
++	ret = spi_write(spi, txbuf, n);
++	return ret;
++}
++
++int spi_read_slt(int id, void *rxbuf, size_t n)
++{
++	int ret = -1;
++	struct spi_device *spi = NULL;
++
++	if (id >= MAX_SPI_DEV_NUM)
++		return ret;
++	if (!g_spi_test_data[id]) {
++		pr_err("g_spi.%d is NULL\n", id);
++		return ret;
++	} else {
++		spi = g_spi_test_data[id]->spi;
++	}
++
++	ret = spi_read(spi, rxbuf, n);
++	return ret;
++}
++
++int spi_write_then_read_slt(int id, const void *txbuf, unsigned n_tx,
++		void *rxbuf, unsigned n_rx)
++{
++	int ret = -1;
++	struct spi_device *spi = NULL;
++
++	if (id >= MAX_SPI_DEV_NUM)
++		return ret;
++	if (!g_spi_test_data[id]) {
++		pr_err("g_spi.%d is NULL\n", id);
++		return ret;
++	} else {
++		spi = g_spi_test_data[id]->spi;
++	}
++
++	ret = spi_write_then_read(spi, txbuf, n_tx, rxbuf, n_rx);
++	return ret;
++}
++
++int spi_write_and_read_slt(int id, const void *tx_buf,
++			void *rx_buf, size_t len)
++{
++	int ret = -1;
++	struct spi_device *spi = NULL;
++	struct spi_transfer     t = {
++			.tx_buf         = tx_buf,
++			.rx_buf         = rx_buf,
++			.len            = len,
++		};
++	struct spi_message      m;
++
++	if (id >= MAX_SPI_DEV_NUM)
++		return ret;
++	if (!g_spi_test_data[id]) {
++		pr_err("g_spi.%d is NULL\n", id);
++		return ret;
++	} else {
++		spi = g_spi_test_data[id]->spi;
++	}
++
++	spi_message_init(&m);
++	spi_message_add_tail(&t, &m);
++	return spi_sync(spi, &m);
++}
++
++static ssize_t spi_test_write(struct file *file,
++			const char __user *buf, size_t n, loff_t *offset)
++{
++	int argc = 0, i;
++	char tmp[64];
++	char *argv[16];
++	char *cmd, *data;
++	unsigned int id = 0, times = 0, size = 0;
++	unsigned long us = 0, bytes = 0;
++	char *txbuf = NULL, *rxbuf = NULL;
++	ktime_t start_time;
++	ktime_t end_time;
++	ktime_t cost_time;
++
++	memset(tmp, 0, sizeof(tmp));
++	if (copy_from_user(tmp, buf, n))
++		return -EFAULT;
++	cmd = tmp;
++	data = tmp;
++
++	while (data < (tmp + n)) {
++		data = strstr(data, " ");
++		if (!data)
++			break;
++		*data = 0;
++		argv[argc] = ++data;
++		argc++;
++		if (argc >= 16)
++			break;
++	}
++
++	tmp[n - 1] = 0;
++
++	if (!strcmp(cmd, "setspeed")) {
++		int id = 0, val;
++		struct spi_device *spi = NULL;
++
++		sscanf(argv[0], "%d", &id);
++		sscanf(argv[1], "%d", &val);
++
++		if (id >= MAX_SPI_DEV_NUM)
++			return n;
++		if (!g_spi_test_data[id]) {
++			pr_err("g_spi.%d is NULL\n", id);
++			return n;
++		} else {
++			spi = g_spi_test_data[id]->spi;
++		}
++		spi->max_speed_hz = val;
++	} else if (!strcmp(cmd, "write")) {
++		char name[64];
++		int fd;
++		mm_segment_t old_fs = get_fs();
++
++		sscanf(argv[0], "%d", &id);
++		sscanf(argv[1], "%d", &times);
++		sscanf(argv[2], "%d", &size);
++		if (argc > 3) {
++			sscanf(argv[3], "%s", name);
++			set_fs(KERNEL_DS);
++		}
++
++		txbuf = kzalloc(size, GFP_KERNEL);
++		if (!txbuf) {
++			printk("spi write alloc buf size %d fail\n", size);
++			return n;
++		}
++
++		if (argc > 3) {
++			fd = sys_open(name, O_RDONLY, 0);
++			if (fd < 0) {
++				printk("open %s fail\n", name);
++			} else {
++				sys_read(fd, (char __user *)txbuf, size);
++				sys_close(fd);
++			}
++			set_fs(old_fs);
++		} else {
++			for (i = 0; i < size; i++)
++				txbuf[i] = i % 256;
++		}
++
++		start_time = ktime_get();
++		for (i = 0; i < times; i++)
++			spi_write_slt(id, txbuf, size);
++		end_time = ktime_get();
++		cost_time = ktime_sub(end_time, start_time);
++		us = ktime_to_us(cost_time);
++
++		bytes = size * times * 1;
++		bytes = bytes * 1000 / us;
++		printk("spi write %d*%d cost %ldus speed:%ldKB/S\n", size, times, us, bytes);
++
++		kfree(txbuf);
++	} else if (!strcmp(cmd, "read")) {
++		sscanf(argv[0], "%d", &id);
++		sscanf(argv[1], "%d", &times);
++		sscanf(argv[2], "%d", &size);
++
++		rxbuf = kzalloc(size, GFP_KERNEL);
++		if (!rxbuf) {
++			printk("spi read alloc buf size %d fail\n", size);
++			return n;
++		}
++
++		start_time = ktime_get();
++		for (i = 0; i < times; i++)
++			spi_read_slt(id, rxbuf, size);
++		end_time = ktime_get();
++		cost_time = ktime_sub(end_time, start_time);
++		us = ktime_to_us(cost_time);
++
++		bytes = size * times * 1;
++		bytes = bytes * 1000 / us;
++		printk("spi read %d*%d cost %ldus speed:%ldKB/S\n", size, times, us, bytes);
++
++		kfree(rxbuf);
++	} else if (!strcmp(cmd, "loop")) {
++		sscanf(argv[0], "%d", &id);
++		sscanf(argv[1], "%d", &times);
++		sscanf(argv[2], "%d", &size);
++
++		txbuf = kzalloc(size, GFP_KERNEL);
++		if (!txbuf) {
++			printk("spi tx alloc buf size %d fail\n", size);
++			return n;
++		}
++
++		rxbuf = kzalloc(size, GFP_KERNEL);
++		if (!rxbuf) {
++			kfree(txbuf);
++			printk("spi rx alloc buf size %d fail\n", size);
++			return n;
++		}
++
++		for (i = 0; i < size; i++)
++			txbuf[i] = i % 256;
++
++		start_time = ktime_get();
++		for (i = 0; i < times; i++)
++			spi_write_and_read_slt(id, txbuf, rxbuf, size);
++
++		end_time = ktime_get();
++		cost_time = ktime_sub(end_time, start_time);
++		us = ktime_to_us(cost_time);
++
++		if (memcmp(txbuf, rxbuf, size))
++			printk("spi loop test fail\n");
++
++		bytes = size * times;
++		bytes = bytes * 1000 / us;
++		printk("spi loop %d*%d cost %ldus speed:%ldKB/S\n", size, times, us, bytes);
++
++		kfree(txbuf);
++		kfree(rxbuf);
++	} else {
++		printk("echo write 0 10 255 > /dev/spi_misc_test\n");
++		printk("echo write 0 10 255 init.rc > /dev/spi_misc_test\n");
++		printk("echo read 0 10 255 > /dev/spi_misc_test\n");
++		printk("echo setspeed 0 1000000 > /dev/spi_misc_test\n");
++	}
++
++	return n;
++}
++
++static const struct file_operations spi_test_fops = {
++	.write = spi_test_write,
++};
++
++static struct miscdevice spi_test_misc = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "spi_misc_test",
++	.fops = &spi_test_fops,
++};
++
++#ifdef CONFIG_OF
++static struct dw_spi_chip *rockchip_spi_parse_dt(struct device *dev)
++{
++	u32 temp;
++	struct dw_spi_chip *spi_chip_data;
++
++	spi_chip_data = devm_kzalloc(dev, sizeof(*spi_chip_data), GFP_KERNEL);
++	if (!spi_chip_data) {
++		dev_err(dev, "memory allocation for spi_chip_data failed\n");
++		return ERR_PTR(-ENOMEM);
++	}
++
++	if (of_property_read_u32(dev->of_node, "poll_mode", &temp)) {
++		dev_warn(dev, "fail to get poll_mode, default set 0\n");
++		spi_chip_data->poll_mode = 0;
++	} else {
++		spi_chip_data->poll_mode = temp;
++	}
++
++	if (of_property_read_u32(dev->of_node, "type", &temp)) {
++		dev_warn(dev, "fail to get type, default set 0\n");
++		spi_chip_data->type = 0;
++	} else {
++		spi_chip_data->type = temp;
++	}
++
++	if (of_property_read_u32(dev->of_node, "enable_dma", &temp)) {
++		dev_warn(dev, "fail to get enable_dma, default set 0\n");
++		spi_chip_data->enable_dma = 0;
++	} else {
++		spi_chip_data->enable_dma = temp;
++	}
++#if 0
++	if (of_property_read_u32(dev->of_node, "slave-enable", &temp)) {
++		dev_warn(dev, "fail to get slave-enable, default set 0\n");
++		spi_chip_data->slave_enable = 0;
++	} else {
++		spi_chip_data->slave_enable = temp;
++	}
++#endif
++	return spi_chip_data;
++}
++#else
++static struct spi_board_info *rockchip_spi_parse_dt(struct device *dev)
++{
++	return dev->platform_data;
++}
++#endif
++
++static int rockchip_spi_test_probe(struct spi_device *spi)
++{
++	int ret;
++	int id = 0;
++	struct dw_spi_chip *spi_chip_data = NULL;
++	struct spi_test_data *spi_test_data = NULL;
++
++	if (!spi)
++		return -ENOMEM;
++
++	if (!spi->dev.of_node)
++		return -ENOMEM;
++
++	spi_chip_data = rockchip_spi_parse_dt(&spi->dev);
++	if (IS_ERR(spi_chip_data))
++		return -ENOMEM;
++
++	spi_test_data = (struct spi_test_data *)kzalloc(sizeof(struct spi_test_data), GFP_KERNEL);
++	if (!spi_test_data) {
++		dev_err(&spi->dev, "ERR: no memory for spi_test_data\n");
++		return -ENOMEM;
++	}
++	spi->bits_per_word = 8;
++	spi->controller_data = spi_chip_data;
++
++	spi_test_data->spi = spi;
++	spi_test_data->dev = &spi->dev;
++
++	ret = spi_setup(spi);
++	if (ret < 0) {
++		dev_err(spi_test_data->dev, "ERR: fail to setup spi\n");
++		return -1;
++	}
++
++	if (of_property_read_u32(spi->dev.of_node, "id", &id)) {
++		dev_warn(&spi->dev, "fail to get id, default set 0\n");
++		id = 0;
++	}
++
++	g_spi_test_data[id] = spi_test_data;
++
++	printk("%s:name=%s,bus_num=%d,cs=%d,mode=%d,speed=%d\n", __func__, spi->modalias, spi->master->bus_num, spi->chip_select, spi->mode, spi->max_speed_hz);
++
++	printk("%s:poll_mode=%d, type=%d, enable_dma=%d\n", __func__, spi_chip_data->poll_mode, spi_chip_data->type, spi_chip_data->enable_dma);
++	return ret;
++}
++
++static int rockchip_spi_test_remove(struct spi_device *spi)
++{
++	printk("%s\n", __func__);
++	return 0;
++}
++
++#ifdef CONFIG_OF
++static const struct of_device_id rockchip_spi_test_dt_match[] = {
++	{ .compatible = "rockchip,spi_test_bus0_cs0", },
++	{ .compatible = "rockchip,spi_test_bus0_cs1", },
++	{ .compatible = "rockchip,spi_test_bus1_cs0", },
++	{ .compatible = "rockchip,spi_test_bus1_cs1", },
++	{ .compatible = "rockchip,spi_test_bus2_cs0", },
++	{ .compatible = "rockchip,spi_test_bus2_cs1", },
++	{ .compatible = "rockchip,spi_test_bus3_cs0", },
++	{ .compatible = "rockchip,spi_test_bus3_cs1", },
++	{ .compatible = "rockchip,spi_test_bus4_cs0", },
++	{ .compatible = "rockchip,spi_test_bus4_cs1", },
++	{},
++};
++MODULE_DEVICE_TABLE(of, rockchip_spi_test_dt_match);
++
++#endif /* CONFIG_OF */
++
++static struct spi_driver spi_rockchip_test_driver = {
++	.driver = {
++		.name	= "spi_test",
++		.owner = THIS_MODULE,
++		.of_match_table = of_match_ptr(rockchip_spi_test_dt_match),
++	},
++	.probe = rockchip_spi_test_probe,
++	.remove = rockchip_spi_test_remove,
++};
++
++static int __init spi_rockchip_test_init(void)
++{
++	int ret = 0;
++
++	misc_register(&spi_test_misc);
++	ret = spi_register_driver(&spi_rockchip_test_driver);
++	return ret;
++}
++module_init(spi_rockchip_test_init);
++
++static void __exit spi_rockchip_test_exit(void)
++{
++	misc_deregister(&spi_test_misc);
++	return spi_unregister_driver(&spi_rockchip_test_driver);
++}
++module_exit(spi_rockchip_test_exit);
++
++MODULE_AUTHOR("Luo Wei <lw@rock-chips.com>");
++MODULE_AUTHOR("Huibin Hong <hhb@rock-chips.com>");
++MODULE_DESCRIPTION("ROCKCHIP SPI TEST Driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("spi:spi_test");
+diff --git a/drivers/spi/spi-rockchip.c b/drivers/spi/spi-rockchip.c
+index 035767c..573b8a4 100644
+--- a/drivers/spi/spi-rockchip.c
++++ b/drivers/spi/spi-rockchip.c
+@@ -13,20 +13,14 @@
+  *
+  */
+ 
+-#include <linux/init.h>
+-#include <linux/module.h>
+ #include <linux/clk.h>
+-#include <linux/err.h>
+-#include <linux/delay.h>
+-#include <linux/interrupt.h>
++#include <linux/dmaengine.h>
++#include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+-#include <linux/slab.h>
+ #include <linux/spi/spi.h>
+-#include <linux/scatterlist.h>
+-#include <linux/of.h>
+ #include <linux/pm_runtime.h>
+-#include <linux/io.h>
+-#include <linux/dmaengine.h>
++#include <linux/scatterlist.h>
+ 
+ #define DRIVER_NAME "rockchip-spi"
+ 
+@@ -179,7 +173,7 @@ struct rockchip_spi {
+ 	u8 tmode;
+ 	u8 bpw;
+ 	u8 n_bytes;
+-	u8 rsd_nsecs;
++	u32 rsd_nsecs;
+ 	unsigned len;
+ 	u32 speed;
+ 
+@@ -192,8 +186,6 @@ struct rockchip_spi {
+ 	/* protect state */
+ 	spinlock_t lock;
+ 
+-	struct completion xfer_completion;
+-
+ 	u32 use_dma;
+ 	struct sg_table tx_sg;
+ 	struct sg_table rx_sg;
+@@ -324,12 +316,12 @@ static void rockchip_spi_handle_err(struct spi_master *master,
+ 	 */
+ 	if (rs->use_dma) {
+ 		if (rs->state & RXBUSY) {
+-			dmaengine_terminate_all(rs->dma_rx.ch);
++			dmaengine_terminate_async(rs->dma_rx.ch);
+ 			flush_fifo(rs);
+ 		}
+ 
+ 		if (rs->state & TXBUSY)
+-			dmaengine_terminate_all(rs->dma_tx.ch);
++			dmaengine_terminate_async(rs->dma_tx.ch);
+ 	}
+ 
+ 	spin_unlock_irqrestore(&rs->lock, flags);
+@@ -438,7 +430,7 @@ static void rockchip_spi_dma_txcb(void *data)
+ 	spin_unlock_irqrestore(&rs->lock, flags);
+ }
+ 
+-static void rockchip_spi_prepare_dma(struct rockchip_spi *rs)
++static int rockchip_spi_prepare_dma(struct rockchip_spi *rs)
+ {
+ 	unsigned long flags;
+ 	struct dma_slave_config rxconf, txconf;
+@@ -454,13 +446,15 @@ static void rockchip_spi_prepare_dma(struct rockchip_spi *rs)
+ 		rxconf.direction = rs->dma_rx.direction;
+ 		rxconf.src_addr = rs->dma_rx.addr;
+ 		rxconf.src_addr_width = rs->n_bytes;
+-		rxconf.src_maxburst = rs->n_bytes;
++		rxconf.src_maxburst = 1;
+ 		dmaengine_slave_config(rs->dma_rx.ch, &rxconf);
+ 
+ 		rxdesc = dmaengine_prep_slave_sg(
+ 				rs->dma_rx.ch,
+ 				rs->rx_sg.sgl, rs->rx_sg.nents,
+ 				rs->dma_rx.direction, DMA_PREP_INTERRUPT);
++		if (!rxdesc)
++			return -EINVAL;
+ 
+ 		rxdesc->callback = rockchip_spi_dma_rxcb;
+ 		rxdesc->callback_param = rs;
+@@ -471,13 +465,18 @@ static void rockchip_spi_prepare_dma(struct rockchip_spi *rs)
+ 		txconf.direction = rs->dma_tx.direction;
+ 		txconf.dst_addr = rs->dma_tx.addr;
+ 		txconf.dst_addr_width = rs->n_bytes;
+-		txconf.dst_maxburst = rs->n_bytes;
++		txconf.dst_maxburst = 16;
+ 		dmaengine_slave_config(rs->dma_tx.ch, &txconf);
+ 
+ 		txdesc = dmaengine_prep_slave_sg(
+ 				rs->dma_tx.ch,
+ 				rs->tx_sg.sgl, rs->tx_sg.nents,
+ 				rs->dma_tx.direction, DMA_PREP_INTERRUPT);
++		if (!txdesc) {
++			if (rxdesc)
++				dmaengine_terminate_sync(rs->dma_rx.ch);
++			return -EINVAL;
++		}
+ 
+ 		txdesc->callback = rockchip_spi_dma_txcb;
+ 		txdesc->callback_param = rs;
+@@ -499,6 +498,8 @@ static void rockchip_spi_prepare_dma(struct rockchip_spi *rs)
+ 		dmaengine_submit(txdesc);
+ 		dma_async_issue_pending(rs->dma_tx.ch);
+ 	}
++
++	return 1;
+ }
+ 
+ static void rockchip_spi_config(struct rockchip_spi *rs)
+@@ -508,7 +509,8 @@ static void rockchip_spi_config(struct rockchip_spi *rs)
+ 	int rsd = 0;
+ 
+ 	u32 cr0 = (CR0_BHT_8BIT << CR0_BHT_OFFSET)
+-		| (CR0_SSD_ONE << CR0_SSD_OFFSET);
++		| (CR0_SSD_ONE << CR0_SSD_OFFSET)
++		| (CR0_EM_BIG << CR0_EM_OFFSET);
+ 
+ 	cr0 |= (rs->n_bytes << CR0_DFS_OFFSET);
+ 	cr0 |= ((rs->mode & 0x3) << CR0_SCPH_OFFSET);
+@@ -525,7 +527,7 @@ static void rockchip_spi_config(struct rockchip_spi *rs)
+ 	if (WARN_ON(rs->speed > MAX_SCLK_OUT))
+ 		rs->speed = MAX_SCLK_OUT;
+ 
+-	/* the minimum divsor is 2 */
++	/* the minimum divisor is 2 */
+ 	if (rs->max_freq < 2 * rs->speed) {
+ 		clk_set_rate(rs->spiclk, 2 * rs->speed);
+ 		rs->max_freq = clk_get_rate(rs->spiclk);
+@@ -555,7 +557,7 @@ static void rockchip_spi_config(struct rockchip_spi *rs)
+ 	writel_relaxed(rs->fifo_len / 2 - 1, rs->regs + ROCKCHIP_SPI_TXFTLR);
+ 	writel_relaxed(rs->fifo_len / 2 - 1, rs->regs + ROCKCHIP_SPI_RXFTLR);
+ 
+-	writel_relaxed(0, rs->regs + ROCKCHIP_SPI_DMATDLR);
++	writel_relaxed(rs->fifo_len / 2 - 1, rs->regs + ROCKCHIP_SPI_DMATDLR);
+ 	writel_relaxed(0, rs->regs + ROCKCHIP_SPI_DMARDLR);
+ 	writel_relaxed(dmacr, rs->regs + ROCKCHIP_SPI_DMACR);
+ 
+@@ -611,12 +613,12 @@ static int rockchip_spi_transfer_one(
+ 	if (rs->use_dma) {
+ 		if (rs->tmode == CR0_XFM_RO) {
+ 			/* rx: dma must be prepared first */
+-			rockchip_spi_prepare_dma(rs);
++			ret = rockchip_spi_prepare_dma(rs);
+ 			spi_enable_chip(rs, 1);
+ 		} else {
+ 			/* tx or tr: spi must be enabled first */
+ 			spi_enable_chip(rs, 1);
+-			rockchip_spi_prepare_dma(rs);
++			ret = rockchip_spi_prepare_dma(rs);
+ 		}
+ 	} else {
+ 		spi_enable_chip(rs, 1);
+@@ -722,8 +724,14 @@ static int rockchip_spi_probe(struct platform_device *pdev)
+ 	master->handle_err = rockchip_spi_handle_err;
+ 
+ 	rs->dma_tx.ch = dma_request_slave_channel(rs->dev, "tx");
+-	if (!rs->dma_tx.ch)
++	if (IS_ERR_OR_NULL(rs->dma_tx.ch)) {
++		/* Check tx to see if we need defer probing driver */
++		if (PTR_ERR(rs->dma_tx.ch) == -EPROBE_DEFER) {
++			ret = -EPROBE_DEFER;
++			goto err_get_fifo_len;
++		}
+ 		dev_warn(rs->dev, "Failed to request TX DMA channel\n");
++	}
+ 
+ 	rs->dma_rx.ch = dma_request_slave_channel(rs->dev, "rx");
+ 	if (!rs->dma_rx.ch) {
+@@ -754,6 +762,7 @@ static int rockchip_spi_probe(struct platform_device *pdev)
+ 	return 0;
+ 
+ err_register_master:
++	pm_runtime_disable(&pdev->dev);
+ 	if (rs->dma_tx.ch)
+ 		dma_release_channel(rs->dma_tx.ch);
+ 	if (rs->dma_rx.ch)
+@@ -783,6 +792,8 @@ static int rockchip_spi_remove(struct platform_device *pdev)
+ 	if (rs->dma_rx.ch)
+ 		dma_release_channel(rs->dma_rx.ch);
+ 
++	spi_master_put(master);
++
+ 	return 0;
+ }
+ 
+@@ -802,6 +813,8 @@ static int rockchip_spi_suspend(struct device *dev)
+ 		clk_disable_unprepare(rs->apb_pclk);
+ 	}
+ 
++	pinctrl_pm_select_sleep_state(dev);
++
+ 	return ret;
+ }
+ 
+@@ -811,6 +824,8 @@ static int rockchip_spi_resume(struct device *dev)
+ 	struct spi_master *master = dev_get_drvdata(dev);
+ 	struct rockchip_spi *rs = spi_master_get_devdata(master);
+ 
++	pinctrl_pm_select_default_state(dev);
++
+ 	if (!pm_runtime_suspended(dev)) {
+ 		ret = clk_prepare_enable(rs->apb_pclk);
+ 		if (ret < 0)
+@@ -870,9 +885,13 @@ static const struct dev_pm_ops rockchip_spi_pm = {
+ };
+ 
+ static const struct of_device_id rockchip_spi_dt_match[] = {
++	{ .compatible = "rockchip,rk3036-spi", },
+ 	{ .compatible = "rockchip,rk3066-spi", },
+ 	{ .compatible = "rockchip,rk3188-spi", },
++	{ .compatible = "rockchip,rk3228-spi", },
+ 	{ .compatible = "rockchip,rk3288-spi", },
++	{ .compatible = "rockchip,rk3368-spi", },
++	{ .compatible = "rockchip,rk3399-spi", },
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, rockchip_spi_dt_match);
+diff --git a/drivers/spi/spidev.c b/drivers/spi/spidev.c
+index d0e7dfc..3f24589 100644
+--- a/drivers/spi/spidev.c
++++ b/drivers/spi/spidev.c
+@@ -695,6 +695,7 @@ static struct class *spidev_class;
+ static const struct of_device_id spidev_dt_ids[] = {
+ 	{ .compatible = "rohm,dh2228fv" },
+ 	{ .compatible = "lineartechnology,ltc2488" },
++        { .compatible = "rockchip,spi_tinker" },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, spidev_dt_ids);

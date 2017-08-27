@@ -1,21 +1,23 @@
 diff --git a/arch/arm/boot/dts/rk3288-miniarm.dts b/arch/arm/boot/dts/rk3288-miniarm.dts
-index bc48294..4729b59 100644
+index f060a8a..2a65e8f 100644
 --- a/arch/arm/boot/dts/rk3288-miniarm.dts
 +++ b/arch/arm/boot/dts/rk3288-miniarm.dts
-@@ -225,16 +225,6 @@
+@@ -484,18 +484,6 @@
  	status = "okay";
  };
  
--&mipi_dsi {
+-&uart1 {
 -	status = "okay";
--	mipi_panel: mipi-panel {
--		compatible ="asus,tc358762";
--		reg = <0>;
--		status = "okay";
--	};
 -};
 -
+-&uart2 {
+-	status = "okay";
+-};
 -
- &gpu {
- 	mali-supply = <&vdd_gpu>;
+-&uart3 {
+-	status = "okay";
+-};
+-
+ &usbphy {
  	status = "okay";
+ };
