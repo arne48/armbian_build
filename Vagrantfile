@@ -7,6 +7,7 @@ $provisioning_script = <<SCRIPT
 # use remote git version instead of sharing a copy from host to preserve proper file permissions
 # and prevent permission related issues for the temp directory
 git clone https://github.com/armbian/build /home/ubuntu/armbian
+mkdir -p /vagrant/output /vagrant/userpatches
 ln -sf /vagrant/output /home/ubuntu/armbian/output
 ln -sf /vagrant/userpatches /home/ubuntu/armbian/userpatches
 SCRIPT
@@ -38,8 +39,8 @@ Vagrant.configure(2) do |config|
     config.vm.provider "virtualbox" do |vb|
         vb.name = "Armbian Builder"
 
-        # comment this to disable the VirtualBox GUI
-        vb.gui = true
+        # uncomment this to enable the VirtualBox GUI
+        #vb.gui = true
 
         # Tweak these to fit your needs.
         #vb.memory = "8192"

@@ -34,8 +34,8 @@ function display() {
 
 function getboardtemp() {
 	if [ -f /etc/armbianmonitor/datasources/soctemp ]; then
-		read raw_temp </etc/armbianmonitor/datasources/soctemp
-		if [ ${raw_temp} -le 200 ]; then
+		read raw_temp </etc/armbianmonitor/datasources/soctemp 2>/dev/null
+		if [ ! -z $(echo "$raw_temp" | grep -o "^[1-9][0-9]*\.\?[0-9]*$") ] && (( $(echo "${raw_temp} < 200" |bc -l) )); then
 			# Allwinner legacy kernels output degree C
 			board_temp=${raw_temp}
 		else
@@ -79,6 +79,10 @@ function batteryinfo() {
 
 function ambienttemp() {
 	# read ambient temperature from USB device if available
+	if [[ ! -f /usr/bin/temper ]]; then
+		echo ""
+		return
+	fi
 	amb_temp=$(temper -c 2>/dev/null)
 	case ${amb_temp} in
 		*"find the USB device"*)
@@ -119,7 +123,7 @@ function storage_info() {
 	root_usage=$(awk '/\// {print $(NF-1)}' <<<${RootInfo} | sed 's/%//g')
 	root_total=$(awk '/\// {print $(NF-4)}' <<<${RootInfo})
 	StorageInfo=$(df -h $storage 2>/dev/null | grep $storage)
-	if [ -n "${StorageInfo}" ]; then
+	if [[ -n "${StorageInfo}" && ${RootInfo} != *$storage* ]]; then
 		storage_usage=$(awk '/\// {print $(NF-1)}' <<<${StorageInfo} | sed 's/%//g')
 		storage_total=$(awk '/\// {print $(NF-4)}' <<<${StorageInfo})
 		[[ "$storage" == */sd* ]] && hdd_temp=$(hddtemp -u C -nq $storage)
@@ -150,10 +154,10 @@ case ${time} in
 esac
 
 # memory and swap
-mem_info=$(LANG=en_US.UTF-8 free -w 2>/dev/null | grep "^Mem" || LANG=en_US.UTF-8 free | grep "^Mem")
+mem_info=$(LC_ALL=C free -w 2>/dev/null | grep "^Mem" || LC_ALL=C free | grep "^Mem")
 memory_usage=$(awk '{printf("%.0f",(($2-($4+$6+$7))/$2) * 100)}' <<<${mem_info})
 memory_total=$(awk '{printf("%d",$2/1024)}' <<<${mem_info})
-swap_info=$(LANG=en_US.UTF-8 free -m | grep "^Swap")
+swap_info=$(LC_ALL=C free -m | grep "^Swap")
 swap_usage=$( (awk '/Swap/ { printf("%3.0f", $3/$2*100) }' <<<${swap_info} 2>/dev/null || echo 0) | tr -c -d '[:digit:]')
 swap_total=$(awk '{print $(2)}' <<<${swap_info})
 

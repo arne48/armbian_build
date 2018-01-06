@@ -14,10 +14,14 @@ Supported build environments:
 - **20GB disk space** or more and **2GB RAM** or more available for the VM, container or native OS,
 - superuser rights (configured `sudo` or root access).
 
-## How to build RT Preempt Kernel for the Asus Tinkerboard
+## How to build RT Preempt Kernel for the Asus Tinkerboard to install it as deb package
 
 - $sudo ./compile.sh CLEAN_LEVEL=make,alldebs USE_CCACHE=no PROGRESS_LOG_TO_FILE=yes CREATE_PATCHES=yes KERNEL_ONLY=yes KERNEL_CONFIGURE=yes BOARD=tinkerboard BRANCH=next RELEASE=xenial
 - Add additional patches or change the kernel config if needed during the process
+
+## How to build a complete RT Preempt enabled Xenial image
+
+- $sudo ./compile.sh CLEAN_LEVEL=make,alldebs USE_CCACHE=no PROGRESS_LOG_TO_FILE=yes BUILD_DESKTOP=yes KERNEL_ONLY=no KERNEL_CONFIGURE=no BOARD=tinkerboard BRANCH=next RELEASE=xenial
 
 ### What works
 
@@ -26,7 +30,7 @@ Supported build environments:
 - Gigabit Ethernet
 - WiFi
 - USB
-- Rebooting
+- (Rebooting)
 
 ### What doesn't work
 

@@ -1,14 +1,14 @@
 # A64 quad core 1GB SoC GBE WiFi
 BOARD_NAME="Orange Pi Win"
-LINUXFAMILY="sun50iw1"
+BOARDFAMILY="sun50iw1"
 BOOTCONFIG="orangepi_win_defconfig"
 #
 MODULES=""
 MODULES_NEXT=""
-CPUMIN="480000"
+CPUMIN="408000"
 CPUMAX="1296000"
 #
-KERNEL_TARGET="dev"
+KERNEL_TARGET="next,dev"
 CLI_TARGET=""
 DESKTOP_TARGET=""
 
@@ -21,3 +21,4 @@ BOARDRATING=""
 CHIP="https://docs.armbian.com/Hardware_Allwinner-H5-A64/"
 HARDWARE="https://linux-sunxi.org/Orange_Pi_Win_Plus"
 FORUMS="https://forum.armbian.com/index.php/forum/11-other-boards/"
+BUY="http://s.click.aliexpress.com/e/VbA6AEq"

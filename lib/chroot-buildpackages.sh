@@ -25,10 +25,12 @@ create_chroot()
 	qemu_binary['armhf']='qemu-arm-static'
 	qemu_binary['arm64']='qemu-aarch64-static'
 	apt_mirror['jessie']="$DEBIAN_MIRROR"
+	apt_mirror['stretch']="$DEBIAN_MIRROR"
 	apt_mirror['xenial']="$UBUNTU_MIRROR"
 	components['jessie']='main,contrib'
+	components['stretch']='main,contrib'
 	components['xenial']='main,universe,multiverse'
-	display_alert "Creating build chroot" "$release $arch" "info"
+	display_alert "Creating build chroot" "$release/$arch" "info"
 	local includes="ccache,locales,git,ca-certificates,devscripts,libfile-fcntllock-perl,debhelper,rsync,python3,distcc"
 	if [[ $NO_APT_CACHER != yes ]]; then
 		local mirror_addr="http://localhost:3142/${apt_mirror[$release]}"
@@ -65,7 +67,7 @@ create_chroot()
 	fi
 	chroot $target_dir /bin/bash -c "/usr/sbin/update-ccache-symlinks"
 	touch $target_dir/root/.debootstrap-complete
-	display_alert "Debootstrap complete" "$release $arch" "info"
+	display_alert "Debootstrap complete" "$release/$arch" "info"
 } #############################################################################
 
 
@@ -78,19 +80,20 @@ chroot_prepare_distccd()
 	local dest=/tmp/distcc/${release}-${arch}
 	declare -A gcc_version gcc_type
 	gcc_version['jessie']='4.9'
+	gcc_version['stretch']='6.3'
 	gcc_version['xenial']='5.4'
 	gcc_type['armhf']='arm-linux-gnueabihf-'
 	gcc_type['arm64']='aarch64-linux-gnu-'
 	rm -f $dest/cmdlist
 	mkdir -p $dest
 	local toolchain_path=$(find_toolchain "${gcc_type[$arch]}" "== ${gcc_version[$release]}")
-	ln -sfv ${toolchain_path}/${gcc_type[$arch]}gcc $dest/cc
+	ln -sf ${toolchain_path}/${gcc_type[$arch]}gcc $dest/cc
 	echo "$dest/cc" >> $dest/cmdlist
 	for compiler in gcc cpp g++ c++; do
 		echo "$dest/$compiler" >> $dest/cmdlist
 		echo "$dest/${gcc_type[$arch]}${compiler}" >> $dest/cmdlist
-		ln -sfv ${toolchain_path}/${gcc_type[$arch]}${compiler} $dest/$compiler
-		ln -sfv ${toolchain_path}/${gcc_type[$arch]}${compiler} $dest/${gcc_type[$arch]}${compiler}
+		ln -sf ${toolchain_path}/${gcc_type[$arch]}${compiler} $dest/$compiler
+		ln -sf ${toolchain_path}/${gcc_type[$arch]}${compiler} $dest/${gcc_type[$arch]}${compiler}
 	done
 	mkdir -p /var/run/distcc/
 	touch /var/run/distcc/${release}-${arch}.pid
@@ -102,16 +105,17 @@ chroot_prepare_distccd()
 #
 chroot_build_packages()
 {
+	local built_ok=()
 	local failed=()
-	for release in jessie xenial; do
+	for release in jessie xenial stretch; do
 		for arch in armhf arm64; do
-			display_alert "Starting package building process" "$release $arch" "info"
+			display_alert "Starting package building process" "$release/$arch" "info"
 
-			local target_dir=$SRC/cache/buildpkg/${release}-${arch}-v5
+			local target_dir=$SRC/cache/buildpkg/${release}-${arch}-v${CHROOT_CACHE_VERSION}
 			local distcc_bindaddr="127.0.0.2"
 
 			[[ ! -f $target_dir/root/.debootstrap-complete ]] && create_chroot "$target_dir" "$release" "$arch"
-			[[ ! -f $target_dir/root/.debootstrap-complete ]] && exit_with_error "Creating chroot failed" "$release"
+			[[ ! -f $target_dir/root/.debootstrap-complete ]] && exit_with_error "Creating chroot failed" "$release/$arch"
 
 			[[ -f /var/run/distcc/${release}-${arch}.pid ]] && kill $(</var/run/distcc/${release}-${arch}.pid) > /dev/null 2>&1
 
@@ -124,7 +128,7 @@ chroot_build_packages()
 
 			local t=$target_dir/root/.update-timestamp
 			if [[ ! -f $t || $(( ($(date +%s) - $(<$t)) / 86400 )) -gt 7 ]]; then
-				display_alert "Upgrading packages" "$release $arch" "info"
+				display_alert "Upgrading packages" "$release/$arch" "info"
 				systemd-nspawn -a -q -D $target_dir /bin/bash -c "apt-get -q update; apt-get -q -y upgrade; apt-get clean"
 				date +%s > $t
 			fi
@@ -136,7 +140,7 @@ chroot_build_packages()
 
 				# check build condition
 				if [[ $(type -t package_checkbuild) == function ]] && ! package_checkbuild; then
-					display_alert "Skipping building $package_name for" "$release $arch"
+					display_alert "Skipping building $package_name for" "$release/$arch"
 					continue
 				fi
 
@@ -156,10 +160,10 @@ chroot_build_packages()
 					needs_building=yes
 				fi
 				if [[ $needs_building == no ]]; then
-					display_alert "Packages are up to date" "$package_name $release $arch" "info"
+					display_alert "Packages are up to date" "$package_name $release/$arch" "info"
 					continue
 				fi
-				display_alert "Building packages" "$package_name $release $arch" "ext"
+				display_alert "Building packages" "$package_name $release/$arch" "ext"
 				local dist_builddeps_name="package_builddeps_${release}"
 				[[ -v $dist_builddeps_name ]] && package_builddeps="$package_builddeps ${!dist_builddeps_name}"
 
@@ -169,11 +173,13 @@ chroot_build_packages()
 				export PATH="/usr/lib/ccache:\$PATH"
 				export HOME="/root"
 				export DEBIAN_FRONTEND="noninteractive"
-				export DEB_BUILD_OPTIONS="nocheck"
+				export DEB_BUILD_OPTIONS="nocheck noautodbgsym"
 				export CCACHE_TEMPDIR="/tmp"
-				export CCACHE_PREFIX="distcc"
+				# distcc is disabled to prevent compilation issues due to different host and cross toolchain configurations
+				#export CCACHE_PREFIX="distcc"
 				# uncomment for debug
 				#export CCACHE_RECACHE="true"
+				#export CCACHE_DISABLE="true"
 				export DISTCC_HOSTS="$distcc_bindaddr"
 				export DEBFULLNAME="$MAINTAINER"
 				export DEBEMAIL="$MAINTAINERMAIL"
@@ -211,12 +217,12 @@ chroot_build_packages()
 							dpkg -i \${p}_*.deb
 						done
 					fi
-					display_alert "Done building" "$package_name $release $arch" "ext"
+					display_alert "Done building" "$package_name $release/$arch" "ext"
 					ls *.deb 2>/dev/null
 					mv *.deb /root 2>/dev/null
 					exit 0
 				else
-					display_alert "Failed building" "$package_name $release $arch" "err"
+					display_alert "Failed building" "$package_name $release/$arch" "err"
 					exit 2
 				fi
 				EOF
@@ -225,18 +231,28 @@ chroot_build_packages()
 
 				fetch_from_repo "$package_repo" "extra/$package_name" "$package_ref"
 
-				eval systemd-nspawn -a -q -D $target_dir --tmpfs=/root/build --tmpfs=/tmp:mode=777 --bind-ro $SRC/packages/extras-buildpkgs/:/root/overlay \
+				eval systemd-nspawn -a -q --capability=CAP_MKNOD -D $target_dir --tmpfs=/root/build --tmpfs=/tmp:mode=777 --bind-ro $SRC/packages/extras-buildpkgs/:/root/overlay \
 					--bind-ro $SRC/cache/sources/extra/:/root/sources /bin/bash -c "/root/build.sh" 2>&1 \
 					${PROGRESS_LOG_TO_FILE:+' | tee -a $DEST/debug/buildpkg.log'}
-				[[ ${PIPESTATUS[0]} -eq 2 ]] && failed+=("$package_name:$release:$arch")
+				if [[ ${PIPESTATUS[0]} -eq 2 ]]; then
+					failed+=("$package_name:$release/$arch")
+				else
+					built_ok+=("$package_name:$release/$arch")
+				fi
 				mv $target_dir/root/*.deb $plugin_target_dir 2>/dev/null
 			done
 			# cleanup for distcc
 			kill $(</var/run/distcc/${release}-${arch}.pid)
 		done
 	done
+	if [[ ${#built_ok[@]} -gt 0 ]]; then
+		display_alert "Following packages were built without errors" "" "info"
+		for p in ${built_ok[@]}; do
+			display_alert "$p"
+		done
+	fi
 	if [[ ${#failed[@]} -gt 0 ]]; then
-		display_alert "Following packages failed to build:" "" "wrn"
+		display_alert "Following packages failed to build" "" "wrn"
 		for p in ${failed[@]}; do
 			display_alert "$p"
 		done
@@ -253,7 +269,7 @@ chroot_installpackages_local()
 	aptly -config=$conf repo create temp
 	# NOTE: this works recursively
 	aptly -config=$conf repo add temp $DEST/debs/extra/${RELEASE}-desktop/
-	aptly -config=$conf repo add temp $DEST/debs/extra/utils/
+	aptly -config=$conf repo add temp $DEST/debs/extra/${RELEASE}-utils/
 	# -gpg-key="925644A6"
 	aptly -keyring="$SRC/packages/extras-buildpkgs/buildpkg-public.gpg" -secret-keyring="$SRC/packages/extras-buildpkgs/buildpkg.gpg" -batch=true -config=$conf \
 		 -gpg-key="925644A6" -passphrase="testkey1234" -component=temp -distribution=$RELEASE publish repo temp

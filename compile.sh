@@ -13,9 +13,13 @@
 # use configuration files like config-default.conf to set the build configuration
 # check Armbian documentation for more info
 
-SRC=$(dirname $(realpath ${BASH_SOURCE}))
+SRC="$(dirname "$(realpath "${BASH_SOURCE}")")"
 # fallback for Trusty
-[[ -z $SRC ]] && SRC=$(pwd)
+[[ -z "${SRC}" ]] && SRC="$(pwd)"
+
+# check for whitespace in $SRC and exit for safety reasons
+grep -q "[[:space:]]" <<<"${SRC}" && { echo "\"${SRC}\" contains whitespace. Not supported. Aborting." >&2 ; exit 1 ; }
+
 cd $SRC
 
 if [[ -f $SRC/lib/general.sh && -L $SRC/main.sh ]]; then

@@ -82,6 +82,9 @@ install_common()
 	[[ -n $OVERLAY_PREFIX && -f $SDCARD/boot/armbianEnv.txt ]] && \
 		echo "overlay_prefix=$OVERLAY_PREFIX" >> $SDCARD/boot/armbianEnv.txt
 
+	[[ -n $DEFAULT_OVERLAYS && -f $SDCARD/boot/armbianEnv.txt ]] && \
+		echo "overlays=${DEFAULT_OVERLAYS//,/ }" >> $SDCARD/boot/armbianEnv.txt
+
 	# initial date for fake-hwclock
 	date -u '+%Y-%m-%d %H:%M:%S' > $SDCARD/etc/fake-hwclock.data
 
@@ -97,30 +100,29 @@ install_common()
 	ff02::2     ip6-allrouters
 	EOF
 
-	display_alert "Installing kernel" "$CHOSEN_KERNEL" "info"
-	chroot $SDCARD /bin/bash -c "dpkg -i /tmp/debs/${CHOSEN_KERNEL}_${REVISION}_${ARCH}.deb" >> $DEST/debug/install.log 2>&1
+	install_deb_chroot "$DEST/debs/${CHOSEN_KERNEL}_${REVISION}_${ARCH}.deb"
 
 	display_alert "Installing u-boot" "$CHOSEN_UBOOT" "info"
-	chroot $SDCARD /bin/bash -c "DEVICE=/dev/null dpkg -i /tmp/debs/${CHOSEN_UBOOT}_${REVISION}_${ARCH}.deb" >> $DEST/debug/install.log 2>&1
+	install_deb_chroot "$DEST/debs/${CHOSEN_UBOOT}_${REVISION}_${ARCH}.deb"
 
 	if [[ $INSTALL_HEADERS == yes ]]; then
-		display_alert "Installing headers" "${CHOSEN_KERNEL/image/headers}" "info"
-		chroot $SDCARD /bin/bash -c "dpkg -i /tmp/debs/${CHOSEN_KERNEL/image/headers}_${REVISION}_${ARCH}.deb" >> $DEST/debug/install.log 2>&1
+		install_deb_chroot "$DEST/debs/${CHOSEN_KERNEL/image/headers}_${REVISION}_${ARCH}.deb"
 	fi
 
-	if [[ -f $SDCARD/tmp/debs/armbian-firmware_${REVISION}_${ARCH}.deb ]]; then
-		display_alert "Installing generic firmware" "armbian-firmware" "info"
-		chroot $SDCARD /bin/bash -c "dpkg -i /tmp/debs/armbian-firmware_${REVISION}_${ARCH}.deb" >> $DEST/debug/install.log 2>&1
+	if [[ -f $DEST/debs/armbian-firmware_${REVISION}_${ARCH}.deb ]]; then
+		install_deb_chroot "$DEST/debs/armbian-firmware_${REVISION}_${ARCH}.deb"
 	fi
 
-	if [[ -f $SDCARD/tmp/debs/${CHOSEN_KERNEL/image/dtb}_${REVISION}_${ARCH}.deb ]]; then
-		display_alert "Installing DTB" "${CHOSEN_KERNEL/image/dtb}" "info"
-		chroot $SDCARD /bin/bash -c "dpkg -i /tmp/debs/${CHOSEN_KERNEL/image/dtb}_${REVISION}_${ARCH}.deb" >> $DEST/debug/install.log 2>&1
+	if [[ -f $DEST/debs/${CHOSEN_KERNEL/image/dtb}_${REVISION}_${ARCH}.deb ]]; then
+		install_deb_chroot "$DEST/debs/${CHOSEN_KERNEL/image/dtb}_${REVISION}_${ARCH}.deb"
+	fi
+
+	if [[ -f $DEST/debs/${CHOSEN_KSRC}_${REVISION}_all.deb && $INSTALL_KSRC == yes ]]; then
+		install_deb_chroot "$DEST/debs/${CHOSEN_KSRC}_${REVISION}_all.deb"
 	fi
 
 	# install board support package
-	display_alert "Installing board support package" "$BOARD" "info"
-	chroot $SDCARD /bin/bash -c "dpkg -i /tmp/debs/$RELEASE/${CHOSEN_ROOTFS}_${REVISION}_${ARCH}.deb" >> $DEST/debug/install.log 2>&1
+	install_deb_chroot "$DEST/debs/$RELEASE/${CHOSEN_ROOTFS}_${REVISION}_${ARCH}.deb"
 
 	# freeze armbian packages
 	if [[ $BSPFREEZE == yes ]]; then
@@ -137,19 +139,29 @@ install_common()
 	[[ $(type -t family_tweaks) == function ]] && family_tweaks
 
 	# enable additional services
-	chroot $SDCARD /bin/bash -c "systemctl --no-reload enable firstrun.service resize2fs.service armhwinfo.service log2ram.service >/dev/null 2>&1"
+	chroot $SDCARD /bin/bash -c "systemctl --no-reload enable firstrun.service resize2fs.service armhwinfo.service log2ram.service firstrun-config.service >/dev/null 2>&1"
 
 	# copy "first run automated config, optional user configured"
- 	cp $SRC/config/armbian_first_run.txt $SDCARD/boot/armbian_first_run.txt
+ 	cp $SRC/packages/bsp/armbian_first_run.txt.template $SDCARD/boot/armbian_first_run.txt.template
 
 	# switch to beta repository at this stage if building nightly images
-	[[ $IMAGE_TYPE == nightly ]] && echo "deb http://beta.armbian.com $RELEASE main utils ${RELEASE}-desktop" > $SDCARD/etc/apt/sources.list.d/armbian.list
+	[[ $IMAGE_TYPE == nightly ]] && echo "deb http://beta.armbian.com $RELEASE main ${RELEASE}-utils ${RELEASE}-desktop" > $SDCARD/etc/apt/sources.list.d/armbian.list
+
+	# Cosmetic fix [FAILED] Failed to start Set console font and keymap at first boot
+	[[ -f $SDCARD/etc/console-setup/cached_setup_font.sh ]] && sed -i "s/^printf '.*/printf '\\\033\%\%G'/g" $SDCARD/etc/console-setup/cached_setup_font.sh
+	[[ -f $SDCARD/etc/console-setup/cached_setup_terminal.sh ]] && sed -i "s/^printf '.*/printf '\\\033\%\%G'/g" $SDCARD/etc/console-setup/cached_setup_terminal.sh
+	[[ -f $SDCARD/etc/console-setup/cached_setup_keyboard.sh ]] && sed -i "s/-u/-x'/g" $SDCARD/etc/console-setup/cached_setup_keyboard.sh
 
 	# disable low-level kernel messages for non betas
 	# TODO: enable only for desktop builds?
 	if [[ -z $BETA ]]; then
 		sed -i "s/^#kernel.printk*/kernel.printk/" $SDCARD/etc/sysctl.conf
 	fi
+
+	# disable repeated messages due to xconsole not being installed.
+	[[ -f $SDCARD/etc/rsyslog.d/50-default.conf ]] && sed '/daemon\.\*\;mail.*/,/xconsole/ s/.*/#&/' -i $SDCARD/etc/rsyslog.d/50-default.conf
+	# disable deprecated parameter
+	sed '/.*$KLogPermitNonKernelFacility.*/,// s/.*/#&/' -i $SDCARD/etc/rsyslog.conf
 
 	# enable getty on serial console
 	chroot $SDCARD /bin/bash -c "systemctl --no-reload enable serial-getty@$SERIALCON.service >/dev/null 2>&1"
@@ -162,13 +174,21 @@ install_common()
 
 	# install initial asound.state if defined
 	mkdir -p $SDCARD/var/lib/alsa/
-	[[ -n $ASOUND_STATE ]] && cp $SRC/config/$ASOUND_STATE $SDCARD/var/lib/alsa/asound.state
+	[[ -n $ASOUND_STATE ]] && cp $SRC/packages/blobs/asound.state/$ASOUND_STATE $SDCARD/var/lib/alsa/asound.state
 
 	# save initial armbian-release state
 	cp $SDCARD/etc/armbian-release $SDCARD/etc/armbian-image-release
 
 	# premit root login via SSH for the first boot
 	sed -i 's/#\?PermitRootLogin .*/PermitRootLogin yes/' $SDCARD/etc/ssh/sshd_config
+
+	if [[ -n $NM_IGNORE_DEVICES ]]; then
+		mkdir -p $SDCARD/etc/NetworkManager/conf.d/
+		cat <<-EOF > $SDCARD/etc/NetworkManager/conf.d/10-ignore-interfaces.conf
+		[keyfile]
+		unmanaged-devices=$NM_IGNORE_DEVICES
+		EOF
+	fi
 }
 
 install_distribution_specific()
@@ -191,7 +211,7 @@ install_distribution_specific()
 		# remove doubled uname from motd
 		[[ -f $SDCARD/etc/update-motd.d/10-uname ]] && rm $SDCARD/etc/update-motd.d/10-uname
 		# rc.local is not existing in stretch but we might need it
-		cat <<-EOF >$SDCARD/etc/rc.local
+		cat <<-EOF > $SDCARD/etc/rc.local
 		#!/bin/sh -e
 		#
 		# rc.local
@@ -207,7 +227,7 @@ install_distribution_specific()
 
 		exit 0
 		EOF
-		chroot $SDCARD /bin/bash -c "chmod +x /etc/rc.local; systemctl daemon-reload"
+		chmod +x $SDCARD/etc/rc.local
 		;;
 	esac
 }

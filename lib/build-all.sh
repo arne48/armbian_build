@@ -52,6 +52,7 @@ pack_upload ()
 		echo $GPG_PASS | gpg --passphrase-fd 0 --armor --detach-sign --batch --yes armbian.txt
 	fi
 
+	if [[ -n "${SEND_TO_SERVER}" ]]; then
 	# create remote directory structure
 	ssh ${SEND_TO_SERVER} "mkdir -p /var/www/dl.armbian.com/${BOARD}/{archive,nightly};";
 
@@ -61,6 +62,13 @@ pack_upload ()
 	find . -type f -not -name '*.7z' -print0 | xargs -0 rm -- ; \
 	while ! rsync -arP $DESTIMG/. -e 'ssh -p 22' ${SEND_TO_SERVER}:/var/www/dl.armbian.com/${BOARD}/${subdir};do sleep 5;done; \
 	rm -r $DESTIMG" &
+	else
+	# pack and move file to debs subdirectory
+	nice -n 19 bash -c "\
+	7za a -t7z -bd -m0=lzma2 -mx=3 -mfb=64 -md=32m -ms=on $filename ${version}.img armbian.txt *.asc sha256sum.sha >/dev/null 2>&1 ; \
+	find . -type f -not -name '*.7z' -print0 | xargs -0 rm -- ; \
+	mv $filename $DEST/images ; rm -r $DESTIMG" &
+	fi
 }
 
 build_main ()
@@ -76,9 +84,16 @@ create_images_list()
 	#
 	# if parameter is true, than we build beta list
 	#
-	for board in $SRC/config/boards/*.conf; do
+local naming="$SRC/config/boards/*.conf";
+        if [[ "$EXPERT" == "yes" ]]; then naming=$naming" $SRC/config/boards/*.wip"; fi
+	for board in $naming; do
 		BOARD=$(basename $board | cut -d'.' -f1)
-		source $SRC/config/boards/$BOARD.conf
+		local file="${SRC}/config/boards/${BOARD}"
+		if [[ -f $file".conf" ]]; then source $file".conf"; fi
+		if [[ -f $file".wip"  ]]; then source $file".wip"; fi
+
+
+
 		if [[ -n $CLI_TARGET && -z $1 ]]; then
 
 			# RELEASES : BRANCHES
@@ -196,13 +211,13 @@ echo -e "\n${#buildlist[@]} total\n"
 buildall_start=`date +%s`
 n=0
 for line in "${buildlist[@]}"; do
-	unset LINUXFAMILY LINUXCONFIG KERNELDIR KERNELSOURCE KERNELBRANCH BOOTDIR BOOTSOURCE BOOTBRANCH ARCH UBOOT_USE_GCC KERNEL_USE_GCC \
+	unset LINUXFAMILY LINUXCONFIG KERNELDIR KERNELSOURCE KERNELBRANCH BOOTDIR BOOTSOURCE BOOTBRANCH ARCH UBOOT_USE_GCC KERNEL_USE_GCC DEFAULT_OVERLAYS \
 		CPUMIN CPUMAX UBOOT_VER KERNEL_VER GOVERNOR BOOTSIZE BOOTFS_TYPE UBOOT_TOOLCHAIN KERNEL_TOOLCHAIN PACKAGE_LIST_EXCLUDE KERNEL_IMAGE_TYPE \
-		write_uboot_platform family_tweaks family_tweaks_bsp setup_write_uboot_platform uboot_custom_postprocess atf_custom_postprocess \
-		BOOTSCRIPT UBOOT_TARGET_MAP LOCALVERSION UBOOT_COMPILER KERNEL_COMPILER \
+		write_uboot_platform family_tweaks family_tweaks_bsp setup_write_uboot_platform uboot_custom_postprocess atf_custom_postprocess family_tweaks_s \
+		BOOTSCRIPT UBOOT_TARGET_MAP LOCALVERSION UBOOT_COMPILER KERNEL_COMPILER BOOTCONFIG BOOTCONFIG_VAR_NAME BOOTCONFIG_DEFAULT BOOTCONFIG_NEXT BOOTCONFIG_DEV \
 		MODULES MODULES_NEXT MODULES_DEV INITRD_ARCH HAS_UUID_SUPPORT BOOTENV_FILE BOOTDELAY MODULES_BLACKLIST MODULES_BLACKLIST_NEXT \
 		MODULES_BLACKLIST_DEV MOUNT SDCARD BOOTPATCHDIR KERNELPATCHDIR buildtext RELEASE IMAGE_TYPE OVERLAY_PREFIX ASOUND_STATE \
-		ATF_COMPILER ATF_USE_GCC ATFSOURCE ATFDIR ATFBRANCH ATFSOURCEDIR
+		ATF_COMPILER ATF_USE_GCC ATFSOURCE ATFDIR ATFBRANCH ATFSOURCEDIR PACKAGE_LIST_RM NM_IGNORE_DEVICES DISPLAY_MANAGER family_tweaks_bsp_s
 
 	read BOARD BRANCH RELEASE BUILD_DESKTOP <<< $line
 	n=$[$n+1]

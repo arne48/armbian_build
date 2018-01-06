@@ -38,6 +38,7 @@ backtitle="Armbian building script, http://www.armbian.com | Author: Igor Pecovn
 
 # Load libraries
 source $SRC/lib/debootstrap-ng.sh 			# System specific install
+source $SRC/lib/image-helpers.sh			# helpers for OS image building
 source $SRC/lib/distributions.sh 			# System specific install
 source $SRC/lib/desktop.sh 				# Desktop specific install
 source $SRC/lib/compilation.sh 				# Patching and compilation of kernel, uboot, ATF
@@ -63,14 +64,6 @@ for i in "$@"; do
 	fi
 done
 
-if [[ $BETA == yes ]]; then
-	IMAGE_TYPE=nightly
-elif [[ $BETA == no && $BUILD_ALL == yes && -n $GPG_PASS ]]; then
-	IMAGE_TYPE=stable
-else
-	IMAGE_TYPE=user-built
-fi
-
 if [[ $PROGRESS_DISPLAY == none ]]; then
 	OUTPUT_VERYSILENT=yes
 elif [[ $PROGRESS_DISPLAY == dialog ]]; then
@@ -79,7 +72,6 @@ fi
 if [[ $PROGRESS_LOG_TO_FILE != yes ]]; then unset PROGRESS_LOG_TO_FILE; fi
 
 SHOW_WARNING=yes
-CAN_BUILD_STRETCH=yes
 
 if [[ $USE_CCACHE != no ]]; then
 	CCACHE=ccache
@@ -89,14 +81,6 @@ if [[ $USE_CCACHE != no ]]; then
 	[[ $PRIVATE_CCACHE == yes ]] && export CCACHE_DIR=$SRC/cache/ccache
 else
 	CCACHE=""
-fi
-
-# optimize build time with 100% CPU usage
-CPUS=$(grep -c 'processor' /proc/cpuinfo)
-if [[ $USEALLCORES != no ]]; then
-	CTHREADS="-j$(($CPUS + $CPUS/2))"
-else
-	CTHREADS="-j1"
 fi
 
 # Check and install dependencies, directory structure and settings
@@ -128,7 +112,6 @@ if [[ -z $BOARD ]]; then
 	WIP_STATE=supported
 	WIP_BUTTON='CSC/WIP/EOS'
 	STATE_DESCRIPTION=' - Officially supported boards'
-	[[ $EXPERT = yes ]] && DIALOG_EXTRA="--extra-button"
 	temp_rc=$(mktemp)
 	while true; do
 		options=()
@@ -160,7 +143,7 @@ if [[ -z $BOARD ]]; then
 			echo > $temp_rc
 		fi
 		BOARD=$(DIALOGRC=$temp_rc dialog --stdout --title "Choose a board" --backtitle "$backtitle" --scrollbar --colors \
-			--extra-label "Show $WIP_BUTTON" $DIALOG_EXTRA --menu "Select the target board. Displaying:\n$STATE_DESCRIPTION" \
+			--extra-label "Show $WIP_BUTTON" --extra-button --menu "Select the target board. Displaying:\n$STATE_DESCRIPTION" \
 			$TTY_Y $TTY_X $(($TTY_Y - 8)) "${options[@]}")
 		STATUS=$?
 		if [[ $STATUS == 3 ]]; then
@@ -194,6 +177,7 @@ elif [[ -f $SRC/config/boards/${BOARD}.eos ]]; then
 fi
 
 source $SRC/config/boards/${BOARD}.${BOARD_TYPE}
+LINUXFAMILY="${BOARDFAMILY}"
 
 [[ -z $KERNEL_TARGET ]] && exit_with_error "Board configuration does not define valid kernel config"
 
@@ -220,7 +204,7 @@ fi
 if [[ $KERNEL_ONLY != yes && -z $RELEASE ]]; then
 	options=()
 	options+=("jessie" "Debian 8 Jessie")
-	[[ $EXPERT == yes && $CAN_BUILD_STRETCH == yes ]] && options+=("stretch" "Debian 9 Stretch")
+	options+=("stretch" "Debian 9 Stretch")
 	options+=("xenial" "Ubuntu Xenial 16.04 LTS")
 	RELEASE=$(dialog --stdout --title "Choose a release" --backtitle "$backtitle" --menu "Select the target OS release" \
 		$TTY_Y $TTY_X $(($TTY_Y - 8)) "${options[@]}")
@@ -240,6 +224,14 @@ fi
 
 source $SRC/lib/configuration.sh
 
+# optimize build time with 100% CPU usage
+CPUS=$(grep -c 'processor' /proc/cpuinfo)
+if [[ $USEALLCORES != no ]]; then
+	CTHREADS="-j$(($CPUS + $CPUS/2))"
+else
+	CTHREADS="-j1"
+fi
+
 start=`date +%s`
 
 [[ $CLEAN_LEVEL == *sources* ]] && cleaning "sources"
@@ -249,20 +241,30 @@ start=`date +%s`
 if [[ $IGNORE_UPDATES != yes ]]; then
 	display_alert "Downloading sources" "" "info"
 	fetch_from_repo "$BOOTSOURCE" "$BOOTDIR" "$BOOTBRANCH" "yes"
-	BOOTSOURCEDIR=$BOOTDIR/${BOOTBRANCH##*:}
 	fetch_from_repo "$KERNELSOURCE" "$KERNELDIR" "$KERNELBRANCH" "yes"
-	LINUXSOURCEDIR=$KERNELDIR/${KERNELBRANCH##*:}
 	if [[ -n $ATFSOURCE ]]; then
 		fetch_from_repo "$ATFSOURCE" "$ATFDIR" "$ATFBRANCH" "yes"
-		ATFSOURCEDIR=$ATFDIR/${ATFBRANCH##*:}
 	fi
 	fetch_from_repo "https://github.com/linux-sunxi/sunxi-tools" "sunxi-tools" "branch:master"
-	fetch_from_repo "https://github.com/armbian/config" "armbian-config" "branch:dev"
 	fetch_from_repo "https://github.com/rockchip-linux/rkbin" "rkbin-tools" "branch:master"
+	fetch_from_repo "https://github.com/MarvellEmbeddedProcessors/A3700-utils-marvell" "marvell-tools" "branch:A3700_utils-armada-17.10"
+	fetch_from_repo "https://github.com/armbian/odroidc2-blobs" "odroidc2-blobs" "branch:master"
+fi
+
+if [[ $BETA == yes ]]; then
+	IMAGE_TYPE=nightly
+elif [[ $BETA == no && $BUILD_ALL == yes && -n $GPG_PASS ]]; then
+	IMAGE_TYPE=stable
+else
+	IMAGE_TYPE=user-built
 fi
 
 compile_sunxi_tools
 install_rkbin_tools
+
+BOOTSOURCEDIR=$BOOTDIR/${BOOTBRANCH##*:}
+LINUXSOURCEDIR=$KERNELDIR/${KERNELBRANCH##*:}
+[[ -n $ATFSOURCE ]] && ATFSOURCEDIR=$ATFDIR/${ATFBRANCH##*:}
 
 # define package names
 DEB_BRANCH=${BRANCH//default}
@@ -271,6 +273,7 @@ DEB_BRANCH=${DEB_BRANCH:+${DEB_BRANCH}-}
 CHOSEN_UBOOT=linux-u-boot-${DEB_BRANCH}${BOARD}
 CHOSEN_KERNEL=linux-image-${DEB_BRANCH}${LINUXFAMILY}
 CHOSEN_ROOTFS=linux-${RELEASE}-root-${DEB_BRANCH}${BOARD}
+CHOSEN_KSRC=linux-source-${BRANCH}-${LINUXFAMILY}
 
 for option in $(tr ',' ' ' <<< "$CLEAN_LEVEL"); do
 	[[ $option != sources ]] && cleaning "$option"

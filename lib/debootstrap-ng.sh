@@ -12,14 +12,8 @@
 # create_rootfs_cache
 # prepare_partitions
 # create_image
-# mount_chroot
-# umount_chroot
-# unmount_on_exit
-# check_loop_device
 
-# custom_debootstrap_ng
-#
-# main debootstrap function
+# debootstrap_ng
 #
 debootstrap_ng()
 {
@@ -54,9 +48,6 @@ debootstrap_ng()
 	# stage: install kernel and u-boot packages
 	# install distribution and board specific applications
 
-	mkdir -p $SDCARD/tmp/debs
-	mount --bind $DEST/debs/ $SDCARD/tmp/debs
-
 	install_distribution_specific
 	install_common
 
@@ -70,10 +61,6 @@ debootstrap_ng()
 	[[ $EXTERNAL_NEW == compile ]] && chroot_installpackages_local
 	# install from apt.armbian.com
 	[[ $EXTERNAL_NEW == prebuilt ]] && chroot_installpackages "yes"
-
-	# cleanup for install_kernel and install_board_specific
-	umount $SDCARD/tmp/debs
-	mountpoint -q $SDCARD/tmp/debs || rm -rf $SDCARD/tmp/debs
 
 	# stage: user customization script
 	# NOTE: installing too many packages may fill tmpfs mount
@@ -181,7 +168,7 @@ create_rootfs_cache()
 		create_sources_list "$RELEASE" "$SDCARD/"
 
 		# stage: add armbian repository and install key
-		echo "deb http://apt.armbian.com $RELEASE main utils ${RELEASE}-desktop" > $SDCARD/etc/apt/sources.list.d/armbian.list
+		echo "deb http://apt.armbian.com $RELEASE main ${RELEASE}-utils ${RELEASE}-desktop" > $SDCARD/etc/apt/sources.list.d/armbian.list
 
 		cp $SRC/config/armbian.key $SDCARD
 		eval 'chroot $SDCARD /bin/bash -c "cat armbian.key | apt-key add -"' \
@@ -291,7 +278,7 @@ prepare_partitions()
 	# mountopts[ext2] is empty
 	# mountopts[fat] is empty
 	# mountopts[f2fs] is empty
-	# mountopts[btrfs] is empty
+	mountopts[btrfs]=',commit=600,compress=lzo'
 	# mountopts[nfs] is empty
 
 	# stage: determine partition configuration
@@ -330,9 +317,19 @@ prepare_partitions()
 		fi
 	else
 		local imagesize=$(( $rootfs_size + $OFFSET + $BOOTSIZE )) # MiB
-		# Hardcoded overhead +40% and +128MB for ext4 is needed for desktop images, for CLI it can be lower
-		# also add extra 128 MiB for the emergency swap file creation and align the size up to 4MiB
-		local sdsize=$(bc -l <<< "scale=0; ((($imagesize * 1.4) / 1 + 128) / 4 + 1) * 4")
+		case $ROOTFS_TYPE in
+			btrfs)
+				# Used for server images, currently no swap functionality, so disk space
+				# requirements are rather low since rootfs gets filled with compress-force=zlib
+				local sdsize=$(bc -l <<< "scale=0; (($imagesize * 0.8) / 4 + 1) * 4")
+				;;
+			*)
+				# Hardcoded overhead +40% and +128MB for ext4 is needed for desktop images,
+				# for CLI it could be lower. Also add extra 128 MiB for the emergency swap
+				# file creation and align the size up to 4MiB
+				local sdsize=$(bc -l <<< "scale=0; ((($imagesize * 1.4) / 1 + 128) / 4 + 1) * 4")
+				;;
+		esac
 	fi
 
 	# stage: create blank image
@@ -417,6 +414,7 @@ prepare_partitions()
 
 	# if we have boot.ini = remove armbianEnv.txt and add UUID there if enabled
 	if [[ -f $SDCARD/boot/boot.ini ]]; then
+		sed -i -e "s/rootfstype \"ext4\"/rootfstype \"$ROOTFS_TYPE\"/" $SDCARD/boot/boot.ini
 		[[ $HAS_UUID_SUPPORT == yes ]] && sed -i 's/^setenv rootdev .*/setenv rootdev "'$rootfs'"/' $SDCARD/boot/boot.ini
 		[[ -f $SDCARD/boot/armbianEnv.txt ]] && rm $SDCARD/boot/armbianEnv.txt
 	fi
@@ -496,61 +494,4 @@ create_image()
 	# call custom post build hook
 	[[ $(type -t post_build_image) == function ]] && post_build_image "$DEST/images/${version}.img"
 
-} #############################################################################
-
-# mount_chroot <target>
-#
-# helper to reduce code duplication
-#
-mount_chroot()
-{
-	local target=$1
-	mount -t proc chproc $target/proc
-	mount -t sysfs chsys $target/sys
-	mount -t devtmpfs chdev $target/dev || mount --bind /dev $target/dev
-	mount -t devpts chpts $target/dev/pts
-} #############################################################################
-
-# umount_chroot <target>
-#
-# helper to reduce code duplication
-#
-umount_chroot()
-{
-	local target=$1
-	umount -l $target/dev/pts >/dev/null 2>&1
-	umount -l $target/dev >/dev/null 2>&1
-	umount -l $target/proc >/dev/null 2>&1
-	umount -l $target/sys >/dev/null 2>&1
-} #############################################################################
-
-# unmount_on_exit
-#
-unmount_on_exit()
-{
-	trap - INT TERM EXIT
-	umount_chroot "$SDCARD/"
-	umount -l $SDCARD/tmp >/dev/null 2>&1
-	umount -l $SDCARD >/dev/null 2>&1
-	umount -l $MOUNT/boot >/dev/null 2>&1
-	umount -l $MOUNT >/dev/null 2>&1
-	losetup -d $LOOP >/dev/null 2>&1
-	umount -l $SDCARD/tmp/debs >/dev/null 2>&1
-	rm -rf --one-file-system $SDCARD
-	exit_with_error "debootstrap-ng was interrupted"
-} #############################################################################
-
-# check_loop_device <device_node>
-#
-check_loop_device()
-{
-	local device=$1
-	if [[ ! -b $device ]]; then
-		if [[ $CONTAINER_COMPAT == yes && -b /tmp/$device ]]; then
-			display_alert "Creating device node" "$device"
-			mknod -m0660 $device b 0x$(stat -c '%t' "/tmp/$device") 0x$(stat -c '%T' "/tmp/$device")
-		else
-			exit_with_error "Device node $device does not exist"
-		fi
-	fi
 } #############################################################################
