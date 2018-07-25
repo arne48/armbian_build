@@ -1,0 +1,30 @@
+diff --git a/include/linux/mmc/dw_mmc.h b/include/linux/mmc/dw_mmc.h
+index 7776afb0..0cf1b2a2 100644
+--- a/include/linux/mmc/dw_mmc.h
++++ b/include/linux/mmc/dw_mmc.h
+@@ -110,6 +110,7 @@ struct dw_mci_dma_slave {
+  * @irq_flags: The flags to be passed to request_irq.
+  * @irq: The irq value to be passed to request_irq.
+  * @sdio_id0: Number of slot0 in the SDIO interrupt registers.
++ * @cto_timer: Timer for broken command transfer over scheme.
+  * @dto_timer: Timer for broken data transfer over scheme.
+  *
+  * Locking
+@@ -220,7 +221,9 @@ struct dw_mci {
+ 	int			sdio_id0;
+ 
+ 	struct timer_list       cmd11_timer;
++	struct timer_list       cto_timer;
+ 	struct timer_list       dto_timer;
++	struct timer_list	xfer_timer;
+ };
+ 
+ /* DMA ops for Internal/External DMAC interface */
+@@ -245,6 +248,7 @@ struct dw_mci_dma_ops {
+ #define DW_MCI_QUIRK_BROKEN_CARD_DETECTION	BIT(3)
+ /* Timer for broken data transfer over scheme */
+ #define DW_MCI_QUIRK_BROKEN_DTO			BIT(4)
++#define DW_MCI_QUIRK_BROKEN_XFER		BIT(5)
+ 
+ struct dma_pdata;
+ 
