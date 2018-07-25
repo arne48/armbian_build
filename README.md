@@ -30,7 +30,7 @@ Supported build environments:
 - Gigabit Ethernet
 - WiFi
 - USB
-- (Rebooting)
+- Rebooting
 
 ### What doesn't work
 
